@@ -1,0 +1,7 @@
+{
+  "name": "BDNS ETL",
+  "type": "nuevo",
+  "description": "Sistema de administración ETL (seeding y sync)",
+  "status": "pendiente_crear",
+  "version": "1.0.0"
+}
