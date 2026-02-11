@@ -191,6 +191,14 @@ async def get_entities_status(
     ultima_ay = etl_service.get_last_successful_execution("ayudas_estado", year)
     ultima_pp = etl_service.get_last_successful_execution("partidos_politicos", year)
 
+    # Ejecuciones interrumpidas (candidatas a reinicio)
+    int_cat = etl_service.get_last_interrupted_execution("catalogos")
+    int_conv = etl_service.get_last_interrupted_execution("convocatorias", year)
+    int_conc = etl_service.get_last_interrupted_execution("concesiones", year)
+    int_min = etl_service.get_last_interrupted_execution("minimis", year)
+    int_ay = etl_service.get_last_interrupted_execution("ayudas_estado", year)
+    int_pp = etl_service.get_last_interrupted_execution("partidos_politicos", year)
+
     def _fmt(exec_data):
         """Extrae finished_at como ISO string de los datos de ejecución."""
         if not exec_data:
@@ -229,7 +237,8 @@ async def get_entities_status(
             "cambios_pendientes": _cambios(ultima_cat),
             "atemporal": True,
             "can_seed": True,
-            "seed_blocked_reason": None
+            "seed_blocked_reason": None,
+            "interrupted_execution": int_cat,
         },
         {
             "id": "convocatorias",
@@ -240,7 +249,8 @@ async def get_entities_status(
             "progreso": 100 if ultima_conv else 0,
             "cambios_pendientes": _cambios(ultima_conv),
             "can_seed": catalogos_seeded,
-            "seed_blocked_reason": catalogos_reason
+            "seed_blocked_reason": catalogos_reason,
+            "interrupted_execution": int_conv,
         },
         {
             "id": "concesiones",
@@ -251,7 +261,8 @@ async def get_entities_status(
             "progreso": 100 if ultima_conc else 0,
             "cambios_pendientes": _cambios(ultima_conc),
             "can_seed": convocatorias_seeded,
-            "seed_blocked_reason": convocatorias_reason
+            "seed_blocked_reason": convocatorias_reason,
+            "interrupted_execution": int_conc,
         },
         {
             "id": "minimis",
@@ -262,7 +273,8 @@ async def get_entities_status(
             "progreso": 100 if ultima_min else 0,
             "cambios_pendientes": _cambios(ultima_min),
             "can_seed": convocatorias_seeded,
-            "seed_blocked_reason": convocatorias_reason
+            "seed_blocked_reason": convocatorias_reason,
+            "interrupted_execution": int_min,
         },
         {
             "id": "ayudas_estado",
@@ -273,7 +285,8 @@ async def get_entities_status(
             "progreso": 100 if ultima_ay else 0,
             "cambios_pendientes": _cambios(ultima_ay),
             "can_seed": convocatorias_seeded,
-            "seed_blocked_reason": convocatorias_reason
+            "seed_blocked_reason": convocatorias_reason,
+            "interrupted_execution": int_ay,
         },
         {
             "id": "partidos_politicos",
@@ -284,7 +297,8 @@ async def get_entities_status(
             "progreso": 100 if ultima_pp else 0,
             "cambios_pendientes": _cambios(ultima_pp),
             "can_seed": convocatorias_seeded,
-            "seed_blocked_reason": convocatorias_reason
+            "seed_blocked_reason": convocatorias_reason,
+            "interrupted_execution": int_pp,
         }
     ]
 
@@ -325,16 +339,21 @@ async def seed_entity(
     """
     entity_id = request.get("entity_id")
     year = request.get("year")
+    replacing_execution_id = request.get("replacing_execution_id")
 
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id es requerido")
+
+    # Convertir a UUID si viene como string
+    replacing_uuid = UUID(replacing_execution_id) if replacing_execution_id else None
 
     try:
         # Iniciar seeding para la entidad específica
         result = await etl_service.start_seeding(
             year=year or 2024,
             entity=entity_id,
-            batch_size=5000
+            batch_size=5000,
+            replacing_execution_id=replacing_uuid
         )
 
         # Retornar estado actualizado de la entidad
@@ -418,6 +437,38 @@ async def stop_execution(
     result = await etl_service.stop_execution(execution_id)
     if not result["success"]:
         raise HTTPException(status_code=404, detail=result.get("error", "Unknown error"))
+    return result
+
+
+@router.delete("/execution/{execution_id}")
+async def delete_execution(
+    execution_id: UUID,
+    current_user: UserInToken = Depends(require_admin)
+):
+    """
+    Elimina un registro de ejecución del historial.
+    No se puede eliminar una ejecución en curso.
+
+    **Requiere rol de admin.**
+    """
+    result = etl_service.delete_execution(execution_id)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "Unknown error"))
+    return result
+
+
+@router.post("/entities/{entity}/clean-temp")
+async def clean_temp_files(
+    entity: str,
+    year: Optional[int] = Query(None),
+    current_user: UserInToken = Depends(require_admin)
+):
+    """
+    Elimina archivos temporales (CSV intermedios, JSON raw) de una entidad/año.
+
+    **Requiere rol de admin.**
+    """
+    result = etl_service.clean_temp_files(entity, year)
     return result
 
 

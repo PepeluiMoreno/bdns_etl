@@ -67,19 +67,34 @@ CATALOGOS_ETL = [
 ]
 
 def main():
+    errores = []
     with SessionLocal() as session:
-        logger.info("Poblando órganos...")
-        load_organos(session)
-        logger.info("Órganos listos.")
+        logger.warning("Poblando órganos...")
+        try:
+            load_organos(session)
+            logger.warning("Órganos listos.")
+        except Exception as e:
+            msg = f"Error poblando órganos: {e}"
+            logger.error(msg)
+            errores.append(msg)
+
         for entry in CATALOGOS_ETL:
             f = entry["func"]
             args = entry["args"]
-            logger.info(f"Poblando catálogo con {f.__name__}({', '.join(map(str, args))})...")
+            nombre = f.__name__ + "(" + ", ".join(map(str, args)) + ")"
+            logger.warning(f"Poblando catálogo {nombre}...")
             try:
                 f(session, *args)
             except Exception as e:
-                logger.error(f"Error poblando catálogo {f.__name__}: {e}")
-        logger.info("Inicialización completa.")
+                msg = f"Error poblando catálogo {nombre}: {e}"
+                logger.error(msg)
+                errores.append(msg)
+
+    if errores:
+        resumen = "; ".join(errores)
+        raise RuntimeError(f"{len(errores)} catálogo(s) fallaron: {resumen}")
+
+    logger.warning("Inicialización completa.")
 
 if __name__ == "__main__":
     main()

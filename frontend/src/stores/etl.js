@@ -467,6 +467,17 @@ export const useETLStore = defineStore('etl', () => {
     }
   }
 
+  async function deleteExecution(executionId) {
+    try {
+      await axios.delete(`/api/etl/execution/${executionId}`)
+      await loadRecentExecutions()
+      await loadStatistics()
+    } catch (err) {
+      console.error('Error deleting execution:', err)
+      throw err
+    }
+  }
+
   // ==========================================
   // ACTIONS - Entities Management
   // ==========================================
@@ -488,22 +499,38 @@ export const useETLStore = defineStore('etl', () => {
     }
   }
 
-  async function startEntitySeeding(entityId, year = null) {
+  async function startEntitySeeding(entityId, year = null, replacingExecutionId = null) {
     const entity = entities.value.find(e => e.id === entityId)
     if (!entity) throw new Error(`Entidad ${entityId} no encontrada`)
 
     entity.estado = 'seeding'
 
     try {
-      const response = await axios.post('/api/etl/entities/seed', {
+      const payload = {
         entity_id: entityId,
         year: year
-      })
+      }
+      if (replacingExecutionId) {
+        payload.replacing_execution_id = replacingExecutionId
+      }
+      const response = await axios.post('/api/etl/entities/seed', payload)
 
       Object.assign(entity, response.data)
       return response.data
     } catch (err) {
       entity.estado = 'error'
+      throw err
+    }
+  }
+
+  async function cleanTempFiles(entityId, year = null) {
+    try {
+      const params = {}
+      if (year) params.year = year
+      const response = await axios.post(`/api/etl/entities/${entityId}/clean-temp`, null, { params })
+      return response.data
+    } catch (err) {
+      console.error('Error cleaning temp files:', err)
       throw err
     }
   }
@@ -556,8 +583,10 @@ export const useETLStore = defineStore('etl', () => {
     disconnectWebSocket,
     startSeeding,
     stopExecution,
+    deleteExecution,
     loadEntitiesStatus,
     startEntitySeeding,
     startEntitySync,
+    cleanTempFiles,
   }
 })

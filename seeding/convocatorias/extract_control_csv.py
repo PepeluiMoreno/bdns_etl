@@ -1,12 +1,16 @@
 # extract_control_csv.py
 # Genera o actualiza el CSV de control de convocatorias por ejercicio y tipo. Unifica en uno anual y borra los mensuales.
 
+import time
 import requests
 import csv
 from pathlib import Path
 from datetime import datetime
 
 TIPOS = ["C", "A", "L", "O"]
+
+_MAX_RETRIES = 5
+_BACKOFF_BASE = 2  # segundos base para backoff exponencial
 
 def log(msg, level="INFO", modulo="extract_control_csv"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -38,9 +42,23 @@ def fetch_codigos_bdns(year, tipo, csv_path):
             "direccion": "asc",
             "tipoAdministracion": tipo,
         }
-        response = requests.get(url, params=params, timeout=180)
-        response.raise_for_status()
-        data = response.json()
+        # Retry con backoff exponencial para 429
+        data = None
+        for attempt in range(_MAX_RETRIES):
+            response = requests.get(url, params=params, timeout=180)
+            if response.status_code == 429:
+                wait = _BACKOFF_BASE * (2 ** attempt)
+                log(f"[{tipo}] 429 Too Many Requests en página {page}, reintentando en {wait}s (intento {attempt+1}/{_MAX_RETRIES})", "WARNING")
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            break
+        if data is None:
+            # Último intento sin capturar
+            response = requests.get(url, params=params, timeout=180)
+            response.raise_for_status()
+            data = response.json()
         contenido = data.get("content", [])
         log(f"[{tipo}] Página {page}: {len(contenido)} registros")
 
@@ -64,6 +82,7 @@ def fetch_codigos_bdns(year, tipo, csv_path):
         if not contenido or (len(existentes_csv) + len(nuevos)) >= total_esperado:
             break
         page += 1
+        time.sleep(2)  # Rate limiting: 2s entre páginas
 
     todas = list(existentes_csv.values()) + nuevos
     with open(csv_path, "w", newline="", encoding="utf-8") as f:

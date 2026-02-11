@@ -2,6 +2,7 @@
 
 
 import json
+import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -9,11 +10,42 @@ from pathlib import Path
 RUTA_RAW = Path(__file__).resolve().parent.parent.parent / "data" / "json" / "convocatorias" / "raw"
 RUTA_RAW.mkdir(parents=True, exist_ok=True)
 
+# Rate limiting: máximo ~5 req/s compartido entre workers
+_REQUEST_DELAY = 0.2  # segundos entre peticiones por worker
+_MAX_RETRIES = 5
+_BACKOFF_BASE = 2  # segundos base para backoff exponencial
+
+
 def fetch_convocatoria(codigo: str):
+    """Descarga el detalle de una convocatoria por su código BDNS.
+
+    La API devuelve el objeto convocatoria directamente (no envuelto en lista).
+    Retorna una lista con un solo elemento para mantener compatibilidad con
+    el patrón resultados.extend(result) del caller.
+    """
     url = f"https://www.infosubvenciones.es/bdnstrans/api/convocatorias?numConv={codigo}"
+    for attempt in range(_MAX_RETRIES):
+        try:
+            r = requests.get(url, timeout=60)
+            if r.status_code == 429:
+                wait = _BACKOFF_BASE * (2 ** attempt)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            time.sleep(_REQUEST_DELAY)
+            data = r.json()
+            return [data] if isinstance(data, dict) else data
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                wait = _BACKOFF_BASE * (2 ** attempt)
+                time.sleep(wait)
+                continue
+            raise
+    # Último intento sin capturar
     r = requests.get(url, timeout=60)
     r.raise_for_status()
-    return r.json().get("convocatorias", [])
+    data = r.json()
+    return [data] if isinstance(data, dict) else data
 
 def main(year: int, mes: int, tipo: str, workers: int):
     # aquí normalmente sacarías los códigos desde la BD

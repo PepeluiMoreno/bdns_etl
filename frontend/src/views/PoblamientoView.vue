@@ -75,13 +75,13 @@ async function manejarActualizar() {
   }
 }
 
-async function manejarPoblar(entidadId) {
+async function manejarPoblar(entidadId, replacingExecutionId = null) {
   try {
-    await etlStore.startEntitySeeding(entidadId, ejercicioActual.value)
+    await etlStore.startEntitySeeding(entidadId, ejercicioActual.value, replacingExecutionId)
     console.log(`Sincronización iniciada para ${entidadId} en ejercicio ${ejercicioActual.value}`)
   } catch (err) {
     console.error('Error al iniciar sincronización:', err)
-    alert(`Error al iniciar sincronización: ${err.message}`)
+    alert(`Error al iniciar sincronización: ${err.response?.data?.detail || err.message}`)
   }
 }
 

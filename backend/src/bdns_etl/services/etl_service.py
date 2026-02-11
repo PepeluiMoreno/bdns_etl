@@ -8,6 +8,7 @@ Proporciona funcionalidades para:
 - Gestionar jobs y executions
 """
 import asyncio
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -30,7 +31,26 @@ class ETLService:
         # Desde: bdns_etl/backend/src/bdns_etl/services/etl_service.py
         # Hasta: bdns_etl/etl_scripts/
         self.etl_root = Path(__file__).parent.parent.parent.parent.parent / "etl_scripts"
+        self.seeding_dir = self.etl_root.parent / "seeding"
         self.active_processes: Dict[UUID, asyncio.subprocess.Process] = {}
+        self._cleanup_stale_executions()
+
+    def _cleanup_stale_executions(self):
+        """Marca como 'interrupted' las ejecuciones que quedaron en 'running' tras un reinicio."""
+        try:
+            with get_session() as session:
+                stale = session.execute(
+                    select(EtlExecution).where(EtlExecution.status == "running")
+                ).scalars().all()
+                if stale:
+                    for ex in stale:
+                        ex.status = "interrupted"
+                        ex.finished_at = datetime.utcnow()
+                        ex.error_message = "Proceso interrumpido por reinicio del servidor"
+                    session.commit()
+                    print(f"[ETLService] {len(stale)} ejecución(es) huérfana(s) marcadas como interrupted")
+        except Exception as e:
+            print(f"[ETLService] Error limpiando ejecuciones huérfanas: {e}")
 
     # ==========================================
     # ESTADO DEL SISTEMA
@@ -134,6 +154,31 @@ class ETLService:
         except Exception:
             return None
 
+    def get_last_interrupted_execution(self, entity: str, year: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Obtiene la última ejecución interrumpida o fallida (candidata a reinicio)."""
+        try:
+            with get_session() as session:
+                query = (
+                    select(EtlExecution)
+                    .where(EtlExecution.entity == entity)
+                    .where(EtlExecution.status.in_(["interrupted", "failed"]))
+                )
+                if year is not None:
+                    query = query.where(EtlExecution.year == year)
+                query = query.order_by(desc(EtlExecution.finished_at)).limit(1)
+                execution = session.execute(query).scalar_one_or_none()
+                if not execution:
+                    return None
+                return {
+                    "execution_id": str(execution.id),
+                    "status": execution.status,
+                    "finished_at": execution.finished_at,
+                    "error_message": execution.error_message,
+                    "progress": execution.progress_percentage or 0,
+                }
+        except Exception:
+            return None
+
     def check_catalogos_seeded(self) -> dict:
         """
         Verifica que los catálogos necesarios estén poblados.
@@ -181,6 +226,100 @@ class ETLService:
             return result is not None
 
     # ==========================================
+    # CONTROL DE CONCURRENCIA
+    # ==========================================
+
+    def get_blocking_execution(self, entity: str, year: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """
+        Comprueba si hay una ejecución activa o interrumpida que bloquea
+        el lanzamiento de un nuevo proceso para la misma entidad/año.
+
+        Para 'catalogos' (atemporal): busca cualquier running/interrupted de catalogos.
+        Para el resto: busca running/interrupted con el mismo entity+year.
+
+        Returns:
+            Dict con info de la ejecución bloqueante, o None si no hay bloqueo.
+        """
+        try:
+            with get_session() as session:
+                query = (
+                    select(EtlExecution)
+                    .where(EtlExecution.entity == entity)
+                    .where(EtlExecution.status.in_(["running", "interrupted"]))
+                )
+                if entity != "catalogos" and year is not None:
+                    query = query.where(EtlExecution.year == year)
+                query = query.order_by(desc(EtlExecution.started_at)).limit(1)
+                execution = session.execute(query).scalar_one_or_none()
+                if not execution:
+                    return None
+                status_label = "en ejecución" if execution.status == "running" else "interrumpido"
+                return {
+                    "execution_id": str(execution.id),
+                    "status": execution.status,
+                    "status_label": status_label,
+                    "started_at": execution.started_at.isoformat() if execution.started_at else None,
+                    "progress": execution.progress_percentage or 0,
+                }
+        except Exception:
+            return None
+
+    # ==========================================
+    # LIMPIEZA DE ARCHIVOS TEMPORALES
+    # ==========================================
+
+    def _get_temp_paths(self, entity: str, year: Optional[int] = None) -> List[Path]:
+        """Devuelve las rutas de archivos temporales para una entidad/año."""
+        paths = []
+        sd = self.seeding_dir
+
+        if entity == "convocatorias" and year:
+            paths.extend([
+                sd / "control" / f"convocatoria_{year}.csv",
+                sd / "data" / "json" / "convocatorias" / "raw" / f"raw_convocatorias_{year}.json",
+                sd / "data" / "csv" / "convocatorias" / f"convocatorias_{year}.csv",
+            ])
+        elif entity == "concesiones" and year:
+            paths.extend([
+                sd / "data" / "json" / "concesiones" / f"concesiones_{year}.json",
+                sd / "data" / "csv" / "concesiones" / f"concesiones_{year}.csv",
+            ])
+        elif entity == "minimis" and year:
+            paths.append(sd / "minimis" / "data" / f"minimis_{year}.json")
+        elif entity == "ayudas_estado" and year:
+            paths.append(sd / "ayudas_estado" / "data" / f"ayudas_estado_{year}.json")
+        elif entity == "partidos_politicos" and year:
+            paths.append(sd / "partidos_politicos" / "data" / f"partidos_politicos_{year}.json")
+
+        return paths
+
+    def clean_temp_files(self, entity: str, year: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Elimina archivos temporales (CSV intermedios, JSON raw) de una entidad/año.
+
+        Returns:
+            Dict con lista de archivos borrados y errores.
+        """
+        paths = self._get_temp_paths(entity, year)
+        deleted = []
+        errors = []
+
+        for p in paths:
+            if p.exists():
+                try:
+                    p.unlink()
+                    deleted.append(str(p.name))
+                except Exception as e:
+                    errors.append(f"{p.name}: {e}")
+
+        return {
+            "entity": entity,
+            "year": year,
+            "deleted": deleted,
+            "errors": errors,
+        }
+
+    # ==========================================
     # LANZAR PROCESOS
     # ==========================================
 
@@ -188,7 +327,8 @@ class ETLService:
         self,
         year: int,
         entity: str = "all",
-        batch_size: int = 5000
+        batch_size: int = 5000,
+        replacing_execution_id: Optional[UUID] = None
     ) -> Dict[str, Any]:
         """
         Inicia proceso de seeding (carga inicial) para un año.
@@ -197,19 +337,47 @@ class ETLService:
             year: Año a procesar
             entity: Entidad específica ('convocatorias', 'concesiones', 'all')
             batch_size: Tamaño de batch para carga
+            replacing_execution_id: ID de ejecución previa que se reemplaza (relanzamiento)
 
         Returns:
             Dict con execution_id y metadata del proceso
         """
+        # Si estamos relanzando, marcar la ejecución anterior como reemplazada
+        if replacing_execution_id:
+            with get_session() as session:
+                old = session.get(EtlExecution, replacing_execution_id)
+                if old and old.status in ("interrupted", "failed"):
+                    old.status = "replaced"
+                    session.commit()
+
+        # VALIDACIÓN: Control de concurrencia - no lanzar si ya hay un proceso activo/interrumpido
+        blocking = self.get_blocking_execution(entity, year if entity != "catalogos" else None)
+        if blocking:
+            estado = blocking["status_label"]
+            if entity == "catalogos":
+                raise ValueError(
+                    f"Ya existe un proceso de catálogos {estado}. "
+                    "Debe cancelarlo o relanzarlo antes de iniciar uno nuevo."
+                )
+            else:
+                raise ValueError(
+                    f"Ya existe un proceso de {entity} {year} {estado}. "
+                    "Debe cancelarlo o relanzarlo antes de iniciar uno nuevo."
+                )
+
         # VALIDACIÓN: Convocatorias requieren catálogos poblados
         needs_catalogos = ["convocatorias", "all"]
         if entity in needs_catalogos:
+            # Comprobar tablas de catálogo O ejecución exitosa previa
             missing = self.check_catalogos_seeded()
             if missing:
-                tablas = ", ".join(missing.keys())
-                raise ValueError(
-                    f"Debe poblar primero los catálogos ({tablas}) antes de ejecutar convocatorias"
-                )
+                # Fallback: si hubo ejecución exitosa de catálogos, aceptar
+                ultima_cat = self.get_last_successful_execution("catalogos")
+                if not ultima_cat:
+                    tablas = ", ".join(missing.keys())
+                    raise ValueError(
+                        f"Debe poblar primero los catálogos ({tablas}) antes de ejecutar convocatorias"
+                    )
 
         # VALIDACIÓN: Las concesiones requieren que las convocatorias estén pobladas primero
         concesiones_entities = ["concesiones", "minimis", "ayudas_estado", "partidos_politicos", "all_concesiones"]
@@ -372,6 +540,18 @@ class ETLService:
         del self.active_processes[execution_id]
 
         return {"success": True, "status": "cancelled"}
+
+    def delete_execution(self, execution_id: UUID) -> Dict[str, Any]:
+        """Elimina un registro de ejecución del historial. No permite eliminar ejecuciones en curso."""
+        with get_session() as session:
+            execution = session.get(EtlExecution, execution_id)
+            if not execution:
+                return {"success": False, "error": "Ejecución no encontrada"}
+            if execution.status == "running":
+                return {"success": False, "error": "No se puede eliminar una ejecución en curso"}
+            session.delete(execution)
+            session.commit()
+        return {"success": True}
 
     async def _monitor_process(self, execution_id: UUID, process: asyncio.subprocess.Process):
         """Monitorea un proceso ETL y actualiza su estado en tiempo real."""

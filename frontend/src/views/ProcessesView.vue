@@ -160,12 +160,20 @@
                   Cancelar
                 </button>
                 <button
-                  v-if="['cancelled', 'failed'].includes(execution.status)"
-                  @click="restartExecution(execution.execution_id)"
-                  class="text-green-600 hover:text-green-900"
-                  title="Reiniciar"
+                  v-if="['cancelled', 'failed', 'interrupted'].includes(execution.status)"
+                  @click="restartExecution(execution)"
+                  class="text-green-600 hover:text-green-900 mr-2"
+                  :title="execution.status === 'failed' ? 'Reintentar' : execution.status === 'interrupted' ? 'Relanzar' : 'Reiniciar'"
                 >
-                  Reiniciar
+                  {{ execution.status === 'failed' ? 'Reintentar' : execution.status === 'interrupted' ? 'Relanzar' : 'Reiniciar' }}
+                </button>
+                <button
+                  v-if="execution.status !== 'running'"
+                  @click="openDeleteModal(execution)"
+                  class="text-red-600 hover:text-red-900"
+                  title="Eliminar"
+                >
+                  Eliminar
                 </button>
               </td>
             </tr>
@@ -323,6 +331,63 @@
       </div>
     </div>
 
+    <!-- Modal de relanzamiento/reintento -->
+    <div
+      v-if="restartModalExecution"
+      @click="restartModalExecution = null"
+      class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+    >
+      <div
+        @click.stop
+        class="bg-white rounded-lg shadow-xl max-w-md w-full"
+      >
+        <div class="px-6 py-4 border-b border-gray-200">
+          <h3 class="text-lg font-medium text-gray-900">
+            {{ restartModalExecution.status === 'failed' ? 'Reintentar proceso' : 'Relanzar proceso' }}
+          </h3>
+        </div>
+        <div class="px-6 py-4">
+          <p class="text-sm text-gray-600 mb-4">
+            <template v-if="restartModalExecution.status === 'failed'">
+              ¿Reintentar <strong>{{ formatEntityName(restartModalExecution.entity, restartModalExecution.year) }}</strong>?
+              Se volverá a ejecutar el proceso desde el principio.
+            </template>
+            <template v-else>
+              ¿Relanzar <strong>{{ formatEntityName(restartModalExecution.entity, restartModalExecution.year) }}</strong>?
+              Se reanudará desde el último punto de control.
+            </template>
+          </p>
+          <label class="flex items-start gap-2 cursor-pointer">
+            <input
+              v-model="restartDeleteTemp"
+              type="checkbox"
+              class="mt-0.5 rounded border-gray-300 text-green-600 focus:ring-green-500"
+            >
+            <div>
+              <span class="text-sm font-medium text-gray-900">Borrar archivos temporales</span>
+              <p class="text-xs text-gray-500 mt-0.5">
+                Elimina los CSV intermedios y JSON descargados. El proceso empezará desde cero.
+              </p>
+            </div>
+          </label>
+        </div>
+        <div class="px-6 py-4 border-t border-gray-200 flex justify-end gap-3">
+          <button
+            @click="restartModalExecution = null"
+            class="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900 border border-gray-300 rounded-md hover:bg-gray-50"
+          >
+            Cancelar
+          </button>
+          <button
+            @click="confirmRestart"
+            class="px-4 py-2 text-sm font-medium text-white bg-green-600 rounded-md hover:bg-green-700"
+          >
+            {{ restartModalExecution.status === 'failed' ? 'Reintentar' : 'Relanzar' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Modal de cancelación -->
     <div
       v-if="cancelModalExecution"
@@ -334,42 +399,114 @@
         class="bg-white rounded-lg shadow-xl max-w-md w-full"
       >
         <div class="px-6 py-4 border-b border-gray-200">
-          <h3 class="text-lg font-medium text-gray-900">Cancelar Proceso</h3>
+          <h3 class="text-lg font-medium text-gray-900">Cancelar proceso</h3>
         </div>
         <div class="px-6 py-4">
           <p class="text-sm text-gray-600 mb-4">
-            ¿Cómo deseas cancelar este proceso?
+            ¿Cancelar <strong>{{ formatEntityName(cancelModalExecution.entity, cancelModalExecution.year) }}</strong>?
+            El proceso se detendrá y quedará marcado como cancelado.
           </p>
-          <div class="space-y-3">
-            <!-- Opción 1: Mantener progreso -->
-            <button
-              @click="confirmCancel(cancelModalExecution.execution_id, false)"
-              class="w-full px-4 py-3 text-left border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+          <label class="flex items-start gap-2 cursor-pointer">
+            <input
+              v-model="cancelDeleteTemp"
+              type="checkbox"
+              class="mt-0.5 rounded border-gray-300 text-red-600 focus:ring-red-500"
             >
-              <div class="font-medium text-gray-900">Cancelar y mantener progreso</div>
-              <div class="text-xs text-gray-500 mt-1">
-                El proceso se detendrá pero podrás relanzarlo desde donde quedó sin perder los datos procesados.
-              </div>
-            </button>
+            <div>
+              <span class="text-sm font-medium text-gray-900">Borrar archivos temporales</span>
+              <p class="text-xs text-gray-500 mt-0.5">
+                Elimina los CSV intermedios y JSON descargados. La próxima ejecución empezará desde cero.
+              </p>
+            </div>
+          </label>
+        </div>
+        <div class="px-6 py-4 border-t border-gray-200 flex justify-end gap-3">
+          <button
+            @click="cancelModalExecution = null"
+            class="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900 border border-gray-300 rounded-md hover:bg-gray-50"
+          >
+            Cerrar
+          </button>
+          <button
+            @click="confirmCancel"
+            class="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-md hover:bg-red-700"
+          >
+            Cancelar proceso
+          </button>
+        </div>
+      </div>
+    </div>
 
-            <!-- Opción 2: Hacer rollback -->
-            <button
-              @click="confirmCancel(cancelModalExecution.execution_id, true)"
-              class="w-full px-4 py-3 text-left border border-red-300 rounded-lg hover:bg-red-50 transition-colors"
+    <!-- Modal de eliminación -->
+    <div
+      v-if="deleteModalExecution"
+      @click="deleteModalExecution = null"
+      class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+    >
+      <div
+        @click.stop
+        class="bg-white rounded-lg shadow-xl max-w-md w-full"
+      >
+        <div class="px-6 py-4 border-b border-gray-200">
+          <h3 class="text-lg font-medium text-gray-900">Eliminar registro</h3>
+        </div>
+        <div class="px-6 py-4">
+          <p class="text-sm text-gray-600 mb-4">
+            ¿Eliminar el registro de <strong>{{ formatEntityName(deleteModalExecution.entity, deleteModalExecution.year) }}</strong> del historial?
+          </p>
+          <label class="flex items-start gap-2 cursor-pointer">
+            <input
+              v-model="deleteAlsoTemp"
+              type="checkbox"
+              class="mt-0.5 rounded border-gray-300 text-red-600 focus:ring-red-500"
             >
-              <div class="font-medium text-red-900">Cancelar y deshacer cambios</div>
-              <div class="text-xs text-red-600 mt-1">
-                Se revertirán todos los cambios realizados en esta ejecución. Esta acción no se puede deshacer.
-              </div>
-            </button>
-          </div>
+            <div>
+              <span class="text-sm font-medium text-gray-900">Borrar también archivos temporales</span>
+              <p class="text-xs text-gray-500 mt-0.5">
+                Elimina los CSV intermedios y JSON descargados de esta entidad/ejercicio.
+              </p>
+            </div>
+          </label>
+        </div>
+        <div class="px-6 py-4 border-t border-gray-200 flex justify-end gap-3">
+          <button
+            @click="deleteModalExecution = null"
+            class="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900 border border-gray-300 rounded-md hover:bg-gray-50"
+          >
+            Cancelar
+          </button>
+          <button
+            @click="confirmDelete"
+            class="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-md hover:bg-red-700"
+          >
+            Eliminar
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal de error / información -->
+    <div
+      v-if="infoModal"
+      @click="infoModal = null"
+      class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+    >
+      <div
+        @click.stop
+        class="bg-white rounded-lg shadow-xl max-w-md w-full"
+      >
+        <div class="px-6 py-4 border-b border-gray-200">
+          <h3 class="text-lg font-medium text-gray-900">{{ infoModal.title }}</h3>
+        </div>
+        <div class="px-6 py-4">
+          <p class="text-sm text-gray-600">{{ infoModal.message }}</p>
         </div>
         <div class="px-6 py-4 border-t border-gray-200 flex justify-end">
           <button
-            @click="cancelModalExecution = null"
-            class="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900"
+            @click="infoModal = null"
+            class="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700"
           >
-            Cerrar
+            Aceptar
           </button>
         </div>
       </div>
@@ -387,6 +524,12 @@ const etlStore = useETLStore()
 const selectedExecution = ref(null)
 const selectedExecutionId = ref(null)
 const cancelModalExecution = ref(null)
+const cancelDeleteTemp = ref(false)
+const restartModalExecution = ref(null)
+const restartDeleteTemp = ref(false)
+const deleteModalExecution = ref(null)
+const deleteAlsoTemp = ref(false)
+const infoModal = ref(null)
 const currentPage = ref(1)
 const pageSize = ref(50)
 const logAutoScroll = ref(true)
@@ -568,40 +711,81 @@ watch(
 )
 
 function openCancelModal(execution) {
+  cancelDeleteTemp.value = false
   cancelModalExecution.value = execution
 }
 
-async function confirmCancel(executionId, rollback) {
-  // Cerrar el modal
+async function confirmCancel() {
+  const execution = cancelModalExecution.value
+  const deleteTemp = cancelDeleteTemp.value
   cancelModalExecution.value = null
 
   try {
-    // Por ahora, simplemente detenemos la ejecución
-    // TODO: Implementar lógica de rollback cuando el backend lo soporte
-    await etlStore.stopExecution(executionId)
+    await etlStore.stopExecution(execution.execution_id)
 
-    if (rollback) {
-      console.log('Rollback solicitado para:', executionId)
-      // Aquí iría la lógica de rollback cuando esté implementada en el backend
+    if (deleteTemp) {
+      await etlStore.cleanTempFiles(execution.entity, execution.year)
     }
+
+    await etlStore.loadRecentExecutions()
   } catch (error) {
-    console.error('Error canceling execution:', error)
-    alert('Error al cancelar el proceso')
+    console.error('Error cancelando ejecución:', error)
+    infoModal.value = {
+      title: 'Error al cancelar',
+      message: error.response?.data?.detail || error.message
+    }
   }
 }
 
-async function restartExecution(executionId) {
-  if (!confirm('¿Estás seguro de que quieres reiniciar este proceso?')) {
-    return
-  }
+function restartExecution(execution) {
+  restartDeleteTemp.value = false
+  restartModalExecution.value = execution
+}
+
+async function confirmRestart() {
+  const execution = restartModalExecution.value
+  const deleteTemp = restartDeleteTemp.value
+  restartModalExecution.value = null
 
   try {
-    // TODO: Implementar lógica de reinicio en el backend
-    console.log('Reiniciando ejecución:', executionId)
-    alert('Funcionalidad de reinicio pendiente de implementación en el backend')
+    // Borrar archivos temporales si está marcado
+    if (deleteTemp) {
+      await etlStore.cleanTempFiles(execution.entity, execution.year)
+    }
+
+    await etlStore.startEntitySeeding(execution.entity, execution.year, execution.execution_id)
+    await etlStore.loadRecentExecutions()
   } catch (error) {
-    console.error('Error restarting execution:', error)
-    alert('Error al reiniciar el proceso')
+    console.error('Error reiniciando ejecución:', error)
+    infoModal.value = {
+      title: 'No se puede iniciar el proceso',
+      message: error.response?.data?.detail || error.message
+    }
+  }
+}
+
+function openDeleteModal(execution) {
+  deleteAlsoTemp.value = false
+  deleteModalExecution.value = execution
+}
+
+async function confirmDelete() {
+  const execution = deleteModalExecution.value
+  const alsoTemp = deleteAlsoTemp.value
+  deleteModalExecution.value = null
+
+  try {
+    await etlStore.deleteExecution(execution.execution_id)
+
+    if (alsoTemp) {
+      await etlStore.cleanTempFiles(execution.entity, execution.year)
+    }
+  } catch (error) {
+    console.error('Error eliminando ejecución:', error)
+    infoModal.value = {
+      title: 'Error al eliminar',
+      message: error.response?.data?.detail || error.message
+    }
   }
 }
 
@@ -622,7 +806,9 @@ function getStatusClass(status) {
     completed: 'bg-green-100 text-green-800',
     failed: 'bg-red-100 text-red-800',
     cancelled: 'bg-gray-100 text-gray-800',
-    pending: 'bg-yellow-100 text-yellow-800'
+    interrupted: 'bg-orange-100 text-orange-800',
+    pending: 'bg-yellow-100 text-yellow-800',
+    replaced: 'bg-gray-100 text-gray-500'
   }
   return classes[status] || 'bg-gray-100 text-gray-800'
 }
@@ -633,7 +819,9 @@ function getStatusLabel(status) {
     completed: 'Completado',
     failed: 'Fallido',
     cancelled: 'Cancelado',
-    pending: 'Pendiente'
+    interrupted: 'Interrumpido',
+    pending: 'Pendiente',
+    replaced: 'Reemplazado'
   }
   return labels[status] || status
 }

@@ -39,7 +39,7 @@ def extract_convocatorias(year: int, execution_id: UUID, reporter: ETLProgressRe
     """
     Extrae convocatorias para un año: Extract → Transform → Load (COPY).
 
-    Pipeline:
+    Pipeline resumible — cada paso comprueba si su salida ya existe:
     1. Genera CSV de control con códigos BDNS (extract_control_csv)
     2. Descarga detalle JSON de cada convocatoria (fetch_convocatoria)
     3. Transforma JSON a CSV con resolución de FKs (transform_convocatorias_to_csv)
@@ -47,86 +47,104 @@ def extract_convocatorias(year: int, execution_id: UUID, reporter: ETLProgressRe
 
     Requiere catálogos (órganos, reglamentos) poblados al 100%.
     """
+    import csv as csv_mod
+    import json as json_mod
+
     log("=" * 60)
     log(f"INICIANDO EXTRACCIÓN DE CONVOCATORIAS - AÑO {year}")
     log("=" * 60)
 
+    # Rutas de artefactos intermedios
+    control_dir = SEEDING_DIR / "control"
+    csv_anual = control_dir / f"convocatoria_{year}.csv"
+    raw_dir = SEEDING_DIR / "data" / "json" / "convocatorias" / "raw"
+    json_path = raw_dir / f"raw_convocatorias_{year}.json"
+    csv_dir = SEEDING_DIR / "data" / "csv" / "convocatorias"
+    csv_output = csv_dir / f"convocatorias_{year}.csv"
+
+    errores_extract = 0
+
     try:
-        # ── PASO 1: CSV de control (códigos BDNS del año) ──
-        reporter.set_phase("extracting", "Generando CSV de control con códigos BDNS")
-        reporter.update_progress(5)
-
         sys.path.insert(0, str(SEEDING_DIR / "convocatorias"))
-        from extract_control_csv import fetch_codigos_bdns, merge_and_cleanup, TIPOS
 
-        control_dir = SEEDING_DIR / "control"
-        control_dir.mkdir(parents=True, exist_ok=True)
-
-        log(f"INFO: Extrayendo códigos BDNS para los 4 tipos de administración...")
-        for tipo in TIPOS:
-            csv_path = control_dir / f"convocatoria_{year}_{tipo}.csv"
-            log(f"INFO: Tipo {tipo} - extrayendo códigos...")
-            fetch_codigos_bdns(year, tipo, csv_path)
-
-        merge_and_cleanup(year, control_dir)
-        reporter.update_progress(25)
-
-        # Leer CSV anual → códigos pendientes
-        import csv as csv_mod
-        csv_anual = control_dir / f"convocatoria_{year}.csv"
-        codigos_pendientes = []
+        # ── PASO 1: CSV de control (códigos BDNS del año) ──
         if csv_anual.exists():
-            with open(csv_anual, encoding="utf-8") as f:
-                reader = csv_mod.DictReader(f)
-                for row in reader:
-                    if row.get("status") == "pending":
-                        codigos_pendientes.append(row["codigo_bdns"])
+            log(f"RESUME: CSV de control ya existe ({csv_anual}), reutilizando")
+            reporter.update_progress(25)
+        else:
+            reporter.set_phase("extracting", "Generando CSV de control con códigos BDNS")
+            reporter.update_progress(5)
 
-        total_codigos = len(codigos_pendientes)
-        log(f"INFO: {total_codigos} convocatorias pendientes de descargar")
-        reporter.update_progress(30, records_processed=total_codigos)
+            from extract_control_csv import fetch_codigos_bdns, merge_and_cleanup, TIPOS
 
-        if total_codigos == 0:
-            log("INFO: No hay convocatorias pendientes, todas ya están procesadas")
-            reporter.complete(records_processed=0, records_inserted=0, records_updated=0, records_errors=0)
-            return 0
+            control_dir.mkdir(parents=True, exist_ok=True)
+
+            log("INFO: Extrayendo códigos BDNS para los 4 tipos de administración...")
+            for tipo in TIPOS:
+                tipo_path = control_dir / f"convocatoria_{year}_{tipo}.csv"
+                log(f"INFO: Tipo {tipo} - extrayendo códigos...")
+                fetch_codigos_bdns(year, tipo, tipo_path)
+
+            merge_and_cleanup(year, control_dir)
+            reporter.update_progress(25)
 
         # ── PASO 2: Extract – descargar detalle de cada convocatoria ──
-        reporter.set_phase("extracting", "Descargando detalle de convocatorias desde API BDNS")
-        from convocatorias.extract.extract_convocatorias import fetch_convocatoria
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if json_path.exists() and json_path.stat().st_size > 100:
+            log(f"RESUME: JSON raw ya existe ({json_path}, {json_path.stat().st_size / 1024 / 1024:.1f} MB), reutilizando")
+            with open(json_path, encoding="utf-8") as f:
+                resultados = json_mod.load(f)
+            log(f"INFO: {len(resultados)} convocatorias cargadas desde JSON existente")
+            reporter.update_progress(60, records_processed=len(resultados))
+        else:
+            # Leer códigos pendientes del CSV de control
+            codigos_pendientes = []
+            if csv_anual.exists():
+                with open(csv_anual, encoding="utf-8") as f:
+                    reader = csv_mod.DictReader(f)
+                    for row in reader:
+                        if row.get("status") == "pending":
+                            codigos_pendientes.append(row["codigo_bdns"])
 
-        resultados = []
-        errores_extract = 0
-        workers = min(6, total_codigos)
+            total_codigos = len(codigos_pendientes)
+            log(f"INFO: {total_codigos} convocatorias pendientes de descargar")
+            reporter.update_progress(30, records_processed=total_codigos)
 
-        log(f"INFO: Descargando {total_codigos} convocatorias con {workers} workers...")
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(fetch_convocatoria, c): c for c in codigos_pendientes}
-            for i, future in enumerate(as_completed(futures), 1):
-                try:
-                    result = future.result()
-                    resultados.extend(result)
-                except Exception as e:
-                    errores_extract += 1
-                    log(f"WARNING: Error descargando {futures[future]}: {e}")
+            if total_codigos == 0:
+                log("INFO: No hay convocatorias pendientes, todas ya están procesadas")
+                reporter.complete(records_processed=0, records_inserted=0, records_updated=0, records_errors=0)
+                return 0
 
-                if i % 100 == 0:
-                    pct = 30 + int((i / total_codigos) * 30)
-                    reporter.update_progress(pct, records_processed=i)
-                    log(f"INFO: {i}/{total_codigos} convocatorias descargadas...")
+            reporter.set_phase("extracting", "Descargando detalle de convocatorias desde API BDNS")
+            from convocatorias.extract.extract_convocatorias import fetch_convocatoria
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        log(f"INFO: {len(resultados)} convocatorias descargadas, {errores_extract} errores de API")
-        reporter.update_progress(60, records_processed=len(resultados))
+            resultados = []
+            workers = min(3, total_codigos)
 
-        # Guardar JSON raw
-        import json as json_mod
-        raw_dir = SEEDING_DIR / "data" / "json" / "convocatorias" / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        json_path = raw_dir / f"raw_convocatorias_{year}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json_mod.dump(resultados, f, ensure_ascii=False, indent=2)
-        log(f"INFO: JSON guardado en {json_path}")
+            log(f"INFO: Descargando {total_codigos} convocatorias con {workers} workers...")
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(fetch_convocatoria, c): c for c in codigos_pendientes}
+                for i, future in enumerate(as_completed(futures), 1):
+                    try:
+                        result = future.result()
+                        resultados.extend(result)
+                    except Exception as e:
+                        errores_extract += 1
+                        log(f"WARNING: Error descargando {futures[future]}: {e}")
+
+                    if i % 100 == 0:
+                        pct = 30 + int((i / total_codigos) * 30)
+                        reporter.update_progress(pct, records_processed=i)
+                        log(f"INFO: {i}/{total_codigos} convocatorias descargadas...")
+
+            log(f"INFO: {len(resultados)} convocatorias descargadas, {errores_extract} errores de API")
+            reporter.update_progress(60, records_processed=len(resultados))
+
+            # Guardar JSON raw
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json_mod.dump(resultados, f, ensure_ascii=False, indent=2)
+            log(f"INFO: JSON guardado en {json_path}")
 
         # ── PASO 3: Transform – JSON → CSV pipe-separated con FK resolution ──
         reporter.set_phase("transforming", "Transformando JSON a CSV con resolución de FKs")
@@ -134,16 +152,15 @@ def extract_convocatorias(year: int, execution_id: UUID, reporter: ETLProgressRe
 
         from convocatorias.transform.transform_convocatorias_to_csv import transform_convocatorias_to_csv
 
-        csv_dir = SEEDING_DIR / "data" / "csv" / "convocatorias"
         csv_dir.mkdir(parents=True, exist_ok=True)
-        csv_output = csv_dir / f"convocatorias_{year}.csv"
 
+        # Siempre re-transformar (las FKs podrían haber cambiado si se repoblaron catálogos)
         transform_stats = transform_convocatorias_to_csv(json_path, csv_output)
         log(f"INFO: Transform completado: {transform_stats['transformados']}/{transform_stats['total']} "
             f"({transform_stats['sin_organo']} sin órgano, {transform_stats['sin_reglamento']} sin reglamento)")
         reporter.update_progress(80, records_processed=transform_stats['transformados'])
 
-        # ── PASO 4: Load – CSV → BD via COPY ──
+        # ── PASO 4: Load – CSV → BD via COPY (idempotente con ON CONFLICT) ──
         reporter.set_phase("loading", "Cargando convocatorias en BD via COPY")
         reporter.update_progress(85)
 
@@ -158,7 +175,7 @@ def extract_convocatorias(year: int, execution_id: UUID, reporter: ETLProgressRe
                 reader = csv_mod.DictReader(f)
                 rows = list(reader)
                 fieldnames = reader.fieldnames
-            codigos_cargados = {str(r.get("codigo_bdns") or r.get("numeroConvocatoria") or r.get("id")) for r in resultados}
+            codigos_cargados = {str(r.get("codigoBDNS") or r.get("codigo_bdns") or r.get("numeroConvocatoria") or r.get("id")) for r in resultados}
             for row in rows:
                 if row.get("codigo_bdns") in codigos_cargados:
                     row["status"] = "loaded"

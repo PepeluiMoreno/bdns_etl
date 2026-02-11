@@ -4,10 +4,17 @@ listo para carga masiva con COPY.
 
 Resuelve FK IDs (organo_id, reglamento_id) contra tablas de catálogos.
 Requiere que los catálogos estén poblados al 100%.
+
+La API de detalle (/api/convocatorias?numConv=X) devuelve:
+- organo como dict {nivel1, nivel2, nivel3} (sin código)
+- reglamento como dict {descripcion, orden} o null (sin api_id)
+- codigoBDNS como string (no codigo_bdns)
 """
 
 import json
+import re
 import sys
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -26,30 +33,78 @@ CSV_COLUMNS = [
 ]
 
 
+def _normalizar(texto):
+    """Normaliza texto para búsqueda: quita tildes, uppercase, colapsa espacios."""
+    if not texto:
+        return None
+    texto = unicodedata.normalize("NFKD", texto).encode("ASCII", "ignore").decode("ASCII")
+    texto = texto.upper().strip()
+    texto = re.sub(r"\s+", " ", texto)
+    return texto
+
+
 def _build_organo_lookup(session) -> dict:
-    """Construye mapa {codigo_api: uuid} de órganos."""
-    rows = session.execute(text("SELECT codigo, id FROM bdns.organo")).all()
-    return {str(r[0]): str(r[1]) for r in rows}
+    """Construye mapa {(n1_norm, n2_norm, n3_norm): uuid} de órganos."""
+    rows = session.execute(text(
+        "SELECT nivel1_norm, nivel2_norm, nivel3_norm, id FROM bdns.organo "
+        "WHERE nivel1_norm IS NOT NULL"
+    )).all()
+    lookup = {}
+    for r in rows:
+        key = (r[0] or "", r[1] or "", r[2] or "")
+        lookup[key] = str(r[3])
+    return lookup
 
 
 def _build_reglamento_lookup(session) -> dict:
-    """Construye mapa {api_id: uuid} de reglamentos."""
-    rows = session.execute(text("SELECT api_id, id FROM bdns.reglamento WHERE api_id IS NOT NULL")).all()
-    return {int(r[0]): str(r[1]) for r in rows}
+    """Construye mapa {descripcion_norm: uuid} de reglamentos."""
+    rows = session.execute(text(
+        "SELECT descripcion, descripcion_norm, id FROM bdns.reglamento"
+    )).all()
+    lookup = {}
+    for r in rows:
+        if r[1]:
+            lookup[r[1]] = str(r[2])
+        if r[0]:
+            lookup[_normalizar(r[0])] = str(r[2])
+    return lookup
 
 
-def _resolve_fk(data, field_name, lookup, key_type=str):
-    """Resuelve un FK desde el JSON de la API usando el lookup."""
-    value = data.get(field_name)
-    if not value:
+def _resolve_organo(organo_dict, lookup):
+    """Resuelve organo_id desde el dict {nivel1, nivel2, nivel3} de la API."""
+    if not organo_dict or not isinstance(organo_dict, dict):
         return None
-    api_id = value.get("id") if isinstance(value, dict) else value
-    if api_id is None:
+    n1 = _normalizar(organo_dict.get("nivel1")) or ""
+    n2 = _normalizar(organo_dict.get("nivel2")) or ""
+    n3 = _normalizar(organo_dict.get("nivel3")) or ""
+
+    # Buscar con los 3 niveles
+    result = lookup.get((n1, n2, n3))
+    if result:
+        return result
+    # Fallback: buscar solo con nivel1 + nivel2 (nivel3 vacío)
+    if n3:
+        result = lookup.get((n1, n2, ""))
+    return result
+
+
+def _resolve_reglamento(reglamento_dict, lookup):
+    """Resuelve reglamento_id desde el dict {descripcion, orden} de la API."""
+    if not reglamento_dict or not isinstance(reglamento_dict, dict):
         return None
-    try:
-        return lookup.get(key_type(api_id))
-    except (ValueError, TypeError):
+    desc = reglamento_dict.get("descripcion")
+    if not desc:
         return None
+    desc_norm = _normalizar(desc)
+    # Búsqueda exacta por descripción normalizada
+    result = lookup.get(desc_norm)
+    if result:
+        return result
+    # Fallback: buscar si alguna clave del lookup está contenida en la descripción
+    for key, uuid in lookup.items():
+        if key and key in desc_norm:
+            return uuid
+    return None
 
 
 def _parse_date(date_str):
@@ -115,8 +170,9 @@ def transform_convocatorias_to_csv(json_path: Path, csv_path: Path) -> dict:
 
         for rec in records:
             try:
-                # ID BDNS (campo obligatorio)
-                raw_id = (rec.get("codigo_bdns")
+                # ID BDNS: la API de detalle usa "codigoBDNS" (camelCase)
+                raw_id = (rec.get("codigoBDNS")
+                          or rec.get("codigo_bdns")
                           or rec.get("numeroConvocatoria")
                           or rec.get("id"))
                 if not raw_id:
@@ -125,19 +181,21 @@ def transform_convocatorias_to_csv(json_path: Path, csv_path: Path) -> dict:
                     continue
                 id_bdns = str(raw_id).strip()
 
-                # Resolver FKs
-                organo_id = _resolve_fk(rec, "organo", organo_map, str)
+                # Resolver FKs usando formato real de la API
+                organo_id = _resolve_organo(rec.get("organo"), organo_map)
                 if not organo_id:
                     stats["sin_organo"] += 1
 
-                reglamento_id = _resolve_fk(rec, "reglamento", reglamento_map, int)
-                if not reglamento_id:
+                reglamento_id = _resolve_reglamento(rec.get("reglamento"), reglamento_map)
+                if not rec.get("reglamento"):
+                    pass  # No contar como error si la API no incluye reglamento
+                elif not reglamento_id:
                     stats["sin_reglamento"] += 1
 
                 row = "|".join([
                     str(uuid4()),                                        # id
                     id_bdns,                                             # id_bdns
-                    _safe_str(rec.get("codigo_bdns") or id_bdns),        # codigo_bdns
+                    _safe_str(id_bdns),                                  # codigo_bdns
                     _safe_str(rec.get("descripcion"), 500),              # titulo
                     _safe_str(rec.get("descripcionLeng")
                               or rec.get("descripcion")),                # descripcion

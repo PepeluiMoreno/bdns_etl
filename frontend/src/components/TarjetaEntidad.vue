@@ -10,16 +10,27 @@
         </p>
       </div>
 
-      <!-- Icono de sincronización -->
-      <button
-        @click="solicitarConfirmacion"
-        :disabled="estaProcesando || !entidad.can_seed"
-        class="icono-sync"
-        :class="{ 'girando': estaProcesando }"
-        :title="botonSyncTitle"
-      >
-        ⟳
-      </button>
+      <!-- Iconos de acción -->
+      <div class="acciones-header">
+        <button
+          v-if="entidad.interrupted_execution && !estaProcesando"
+          @click="solicitarConfirmacion"
+          class="btn-reiniciar"
+          title="Reiniciar proceso interrumpido"
+        >
+          ↻
+        </button>
+        <button
+          v-else
+          @click="solicitarConfirmacion"
+          :disabled="estaProcesando || !entidad.can_seed"
+          class="icono-sync"
+          :class="{ 'girando': estaProcesando }"
+          :title="botonSyncTitle"
+        >
+          ⟳
+        </button>
+      </div>
     </div>
 
     <!-- Barra de progreso -->
@@ -167,12 +178,14 @@ const colorProgreso = computed(() => {
 })
 
 const textoEstadoSincronizacion = computed(() => {
+  if (props.entidad.interrupted_execution) return 'Interrumpido'
   if (props.entidad.estado === 'complete') return 'Sincronizado'
   if (!props.entidad.ultima_sync) return 'Sin sincronizar'
   return 'Pendiente sincronización'
 })
 
 const claseBadgeEstado = computed(() => {
+  if (props.entidad.interrupted_execution) return 'badge-interrumpido'
   if (props.entidad.estado === 'complete') return 'badge-sincronizado'
   if (!props.entidad.ultima_sync) return 'badge-sin-sincronizar'
   return 'badge-pendiente'
@@ -195,7 +208,8 @@ function solicitarConfirmacion() {
 
 function confirmarPoblar() {
   mostrarModalConfirmacion.value = false
-  emit('poblar', props.entidad.id)
+  const replacingId = props.entidad.interrupted_execution?.execution_id || null
+  emit('poblar', props.entidad.id, replacingId)
 }
 
 function manejarSincronizar() {
@@ -306,6 +320,29 @@ function formatearFecha(fechaString) {
 
 .icono-sync.girando {
   animation: girar-continuo 1.5s linear infinite;
+}
+
+.acciones-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-reiniciar {
+  background: transparent;
+  border: 2px solid #f97316;
+  font-size: 28px;
+  color: #f97316;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+  line-height: 1;
+}
+
+.btn-reiniciar:hover {
+  background-color: #f97316;
+  color: white;
 }
 
 @keyframes girar-continuo {
@@ -434,6 +471,11 @@ function formatearFecha(fechaString) {
 
 .badge-sin-sincronizar {
   background-color: #ef4444;
+  color: #ffffff;
+}
+
+.badge-interrumpido {
+  background-color: #f97316;
   color: #ffffff;
 }
 
