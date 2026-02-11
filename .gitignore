@@ -15,6 +15,10 @@ dist/
 .env
 .env.local
 
+# Docker Secrets (NO SUBIR A GIT)
+secrets/*.txt
+!secrets/.gitkeep
+
 # Logs
 logs/
 *.log
@@ -30,3 +34,6 @@ logs/
 control/*.csv
 json/
 incidencias/
+
+# Claude Code (local only)
+.claude/

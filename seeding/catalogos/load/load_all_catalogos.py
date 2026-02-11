@@ -35,9 +35,9 @@ logging.basicConfig(
 logger = logging.getLogger("ETL_inicializacion")
 
 
-from bdns_core.db.session import SessionLocal, engine
+from bdns_core.db.session import SessionLocal
 from bdns_core.db.models import (
-    Base, Organo, Instrumento, Reglamento, SectorActividad, SectorProducto,
+    Organo, Instrumento, Reglamento, SectorActividad, SectorProducto,
     TipoBeneficiario, Finalidad, Fondo, Objetivo, Region
 )
 from bdns_core.db.enums import TipoOrganoEnum
@@ -48,9 +48,6 @@ from load_organos import load_organos
 from load_catalogos import (
     load_catalogo,
     load_regiones,
-    load_sector_actividad_desde_csv,
-    load_fondo_desde_csv,
-    load_reglamento_desde_csv,
 )
 # ---
 
@@ -60,20 +57,16 @@ VPD = "GE"  # Valor por defecto para el campo VPD en algunos catálogos
 
 CATALOGOS_ETL = [
     # Cada entrada: función y sus argumentos (session va siempre primero)
-    {"func": load_sector_actividad_desde_csv, "args": ["data/populate/estructura_cnae2009.csv"]},
-    {"func": load_fondo_desde_csv, "args": ["data/populate/fondos_europeos.csv"]},
-    {"func": load_reglamento_desde_csv, "args": ["data/populate/reglamentos.csv"]},
     {"func": load_regiones, "args": []},
     {"func": load_catalogo, "args": [Instrumento, "instrumentos"]},
     {"func": load_catalogo, "args": [TipoBeneficiario, "beneficiarios", {"vpd": VPD}]},
     {"func": load_catalogo, "args": [SectorProducto, "sectores"]},
     {"func": load_catalogo, "args": [Finalidad, "finalidades", {"vpd": VPD}]},
     {"func": load_catalogo, "args": [Objetivo, "objetivos"]},
-    {"func": load_catalogo, "args": [Reglamento, "reglamentos"]},   
+    {"func": load_catalogo, "args": [Reglamento, "reglamentos"]},
 ]
 
 def main():
-    Base.metadata.create_all(bind=engine)
     with SessionLocal() as session:
         logger.info("Poblando órganos...")
         load_organos(session)

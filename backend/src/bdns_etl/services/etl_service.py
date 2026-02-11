@@ -9,12 +9,13 @@ Proporciona funcionalidades para:
 """
 import asyncio
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, text
 from sqlalchemy.orm import Session
 
 from bdns_core.db.session import get_session
@@ -25,8 +26,159 @@ class ETLService:
     """Servicio para gestión de procesos ETL."""
 
     def __init__(self):
-        self.etl_root = Path(__file__).parent.parent.parent.parent.parent / "ETL"
-        self.active_processes: Dict[UUID, subprocess.Popen] = {}
+        # Apuntar a la carpeta etl_scripts dentro de bdns_etl
+        # Desde: bdns_etl/backend/src/bdns_etl/services/etl_service.py
+        # Hasta: bdns_etl/etl_scripts/
+        self.etl_root = Path(__file__).parent.parent.parent.parent.parent / "etl_scripts"
+        self.active_processes: Dict[UUID, asyncio.subprocess.Process] = {}
+
+    # ==========================================
+    # ESTADO DEL SISTEMA
+    # ==========================================
+
+    # Tablas de catálogo que se pueblan desde la API BDNS + load_organos
+    CATALOG_TABLES = [
+        {"tabla": "organo", "nombre": "Órganos convocantes"},
+        {"tabla": "region", "nombre": "Regiones"},
+        {"tabla": "instrumento", "nombre": "Instrumentos"},
+        {"tabla": "tipo_beneficiario", "nombre": "Tipos de beneficiario"},
+        {"tabla": "sector_producto", "nombre": "Sectores de producto"},
+        {"tabla": "finalidad", "nombre": "Finalidades"},
+        {"tabla": "objetivo", "nombre": "Objetivos"},
+        {"tabla": "reglamento", "nombre": "Reglamentos"},
+    ]
+
+    def get_system_status(self) -> Dict[str, Any]:
+        """
+        Obtiene el estado general del sistema: BD y catálogos.
+
+        Returns:
+            Dict con estado de backend, BD y detalle de cada catálogo.
+        """
+        result = {
+            "backend": "ok",
+            "database": False,
+            "catalogos": {
+                "inicializados": False,
+                "detalle": []
+            }
+        }
+
+        # 1. Comprobar conexión a BD
+        try:
+            with get_session() as session:
+                session.execute(text("SELECT 1"))
+            result["database"] = True
+        except Exception:
+            return result
+
+        # 2. Comprobar cada tabla de catálogo
+        todos_ok = True
+        for cat in self.CATALOG_TABLES:
+            tabla = cat["tabla"]
+            try:
+                with get_session() as session:
+                    count = session.execute(
+                        text(f"SELECT COUNT(*) FROM bdns.{tabla}")
+                    ).scalar()
+                estado = "ok" if count and count > 0 else "missing"
+            except Exception:
+                count = 0
+                estado = "missing"
+
+            if estado != "ok":
+                todos_ok = False
+
+            result["catalogos"]["detalle"].append({
+                "tabla": tabla,
+                "nombre": cat["nombre"],
+                "registros": count or 0,
+                "estado": estado
+            })
+
+        result["catalogos"]["inicializados"] = todos_ok
+        return result
+
+    # ==========================================
+    # VALIDACIONES
+    # ==========================================
+
+    def get_last_successful_execution(self, entity: str, year: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """
+        Obtiene datos de la última ejecución exitosa para una entidad.
+
+        Returns:
+            Dict con finished_at, records_processed/inserted/updated/errors,
+            o None si no hay ejecuciones exitosas.
+        """
+        try:
+            with get_session() as session:
+                query = (
+                    select(EtlExecution)
+                    .where(EtlExecution.entity == entity)
+                    .where(EtlExecution.status == "completed")
+                )
+                if year is not None:
+                    query = query.where(EtlExecution.year == year)
+                query = query.order_by(desc(EtlExecution.finished_at)).limit(1)
+                execution = session.execute(query).scalar_one_or_none()
+                if not execution:
+                    return None
+                return {
+                    "finished_at": execution.finished_at,
+                    "records_processed": execution.records_processed or 0,
+                    "records_inserted": execution.records_inserted or 0,
+                    "records_updated": execution.records_updated or 0,
+                    "records_errors": execution.records_errors or 0,
+                }
+        except Exception:
+            return None
+
+    def check_catalogos_seeded(self) -> dict:
+        """
+        Verifica que los catálogos necesarios estén poblados.
+
+        Comprueba que las tablas de catálogos (organo, reglamento) tengan
+        registros. Estas son las FKs requeridas por convocatorias.
+
+        Returns:
+            Dict con {tabla: count} para cada catálogo. Vacío si todos están OK.
+            Si alguno está vacío o no existe, incluye la tabla con count=0.
+        """
+        required_catalogs = ["organo", "reglamento"]
+        missing = {}
+        for catalog in required_catalogs:
+            try:
+                with get_session() as session:
+                    count = session.execute(
+                        text(f"SELECT COUNT(*) FROM bdns.{catalog}")
+                    ).scalar()
+                    if not count:
+                        missing[catalog] = 0
+            except Exception:
+                missing[catalog] = 0
+        return missing
+
+    def check_convocatorias_seeded(self, year: int) -> bool:
+        """
+        Verifica si existen convocatorias pobladas para un año dado.
+
+        Args:
+            year: Año a verificar
+
+        Returns:
+            True si hay convocatorias pobladas, False en caso contrario
+        """
+        with get_session() as session:
+            # Buscar ejecuciones exitosas de seeding de convocatorias para este año
+            stmt = select(EtlExecution).where(
+                EtlExecution.execution_type == "seeding",
+                EtlExecution.entity == "convocatorias",
+                EtlExecution.year == year,
+                EtlExecution.status == "completed"
+            )
+            result = session.execute(stmt).first()
+            return result is not None
 
     # ==========================================
     # LANZAR PROCESOS
@@ -49,28 +201,65 @@ class ETLService:
         Returns:
             Dict con execution_id y metadata del proceso
         """
+        # VALIDACIÓN: Convocatorias requieren catálogos poblados
+        needs_catalogos = ["convocatorias", "all"]
+        if entity in needs_catalogos:
+            missing = self.check_catalogos_seeded()
+            if missing:
+                tablas = ", ".join(missing.keys())
+                raise ValueError(
+                    f"Debe poblar primero los catálogos ({tablas}) antes de ejecutar convocatorias"
+                )
+
+        # VALIDACIÓN: Las concesiones requieren que las convocatorias estén pobladas primero
+        concesiones_entities = ["concesiones", "minimis", "ayudas_estado", "partidos_politicos", "all_concesiones"]
+        # TODO: añadir "grandes_beneficiarios" cuando se reactive
+        if entity in concesiones_entities:
+            if not self.check_convocatorias_seeded(year):
+                raise ValueError(
+                    f"Debe poblar antes las convocatorias del ejercicio {year}"
+                )
+
         with get_session() as session:
+            # Determinar entrypoint según la entidad
+            entrypoint_map = {
+                # Principales
+                "convocatorias": "ETL/convocatorias/orchestrator_convocatorias.py",
+                "concesiones": "ETL/concesiones/orchestrator_concesiones.py",
+                "catalogos": "ETL/seeding/catalogos/load/load_all_catalogos.py",
+
+                # Concesiones individuales (retención 10 años)
+                "minimis": "ETL/seeding/minimis/extract_minimis.py",
+                "ayudas_estado": "ETL/seeding/ayudas_estado/extract_ayudas_estado.py",
+                "partidos_politicos": "ETL/seeding/partidos_politicos/extract_partidos_politicos.py",
+                # TODO: reactivar cuando se implemente
+                # "grandes_beneficiarios": "ETL/seeding/grandes_beneficiarios/extract_grandes_beneficiarios.py",
+
+                # Orquestador maestro de todas las concesiones (4 fuentes)
+                "all_concesiones": "ETL/seeding/orchestrate_all_concesiones.py",
+            }
+            entrypoint = entrypoint_map.get(entity, "ETL/run_etl.py")
+
             # Crear registro de ejecución
             execution = EtlExecution(
-                process_type="seeding",
+                execution_type="seeding",
                 entity=entity,
                 year=year,
                 status="running",
                 started_at=datetime.utcnow(),
-                config={
-                    "batch_size": batch_size,
-                    "mode": "full_load"
-                }
+                entrypoint=entrypoint,
+                current_phase="initializing",
+                progress_percentage=0
             )
             session.add(execution)
             session.commit()
             session.refresh(execution)
             execution_id = execution.id
 
-        # Lanzar proceso en background
+        # Lanzar proceso en background (usar mismo intérprete que el backend)
         script_path = self.etl_root / "run_etl.py"
         cmd = [
-            "python",
+            sys.executable,
             str(script_path),
             "--year", str(year),
             "--mode", "seeding",
@@ -119,15 +308,11 @@ class ETLService:
         """
         with get_session() as session:
             execution = EtlExecution(
-                process_type="sync",
+                execution_type="sync",
                 entity=entity,
                 year=year,
                 status="running",
-                started_at=datetime.utcnow(),
-                config={
-                    "incremental": incremental,
-                    "days_back": days_back
-                }
+                started_at=datetime.utcnow()
             )
             session.add(execution)
             session.commit()
@@ -136,7 +321,7 @@ class ETLService:
 
         script_path = self.etl_root / "run_etl.py"
         cmd = [
-            "python",
+            sys.executable,
             str(script_path),
             "--year", str(year),
             "--mode", "sync",
@@ -189,19 +374,57 @@ class ETLService:
         return {"success": True, "status": "cancelled"}
 
     async def _monitor_process(self, execution_id: UUID, process: asyncio.subprocess.Process):
-        """Monitorea un proceso ETL y actualiza su estado."""
-        try:
-            stdout, stderr = await process.communicate()
+        """Monitorea un proceso ETL y actualiza su estado en tiempo real."""
+        log_lines = []
 
+        try:
+            # Leer stdout línea por línea en tiempo real
+            async for line in process.stdout:
+                decoded_line = line.decode('utf-8').rstrip()
+                log_lines.append(decoded_line)
+
+                # Actualizar log en DB cada 10 líneas para no sobrecargar
+                if len(log_lines) % 10 == 0:
+                    current_log = '\n'.join(log_lines)
+                    with get_session() as session:
+                        execution = session.get(EtlExecution, execution_id)
+                        if execution:
+                            execution.log = current_log
+                            session.commit()
+
+            # Esperar a que el proceso termine
+            await process.wait()
+
+            # Leer stderr si hay
+            stderr_data = await process.stderr.read() if process.stderr else b''
+            if stderr_data:
+                stderr_text = stderr_data.decode('utf-8')
+                log_lines.append(f"\n--- STDERR ---\n{stderr_text}")
+
+            # Actualización final
+            final_log = '\n'.join(log_lines)
             with get_session() as session:
                 execution = session.get(EtlExecution, execution_id)
                 if execution:
                     execution.finished_at = datetime.utcnow()
                     execution.status = "completed" if process.returncode == 0 else "failed"
+                    execution.log = final_log
 
                     if process.returncode != 0:
-                        execution.error = stderr.decode('utf-8')[-500:]  # Últimos 500 chars
+                        execution.error_message = stderr_text[:500] if stderr_data else "Process failed with no error message"
 
+                    session.commit()
+        except Exception as e:
+            # En caso de error, guardar lo que tengamos
+            error_msg = f"Monitor error: {str(e)}"
+            log_lines.append(error_msg)
+            with get_session() as session:
+                execution = session.get(EtlExecution, execution_id)
+                if execution:
+                    execution.finished_at = datetime.utcnow()
+                    execution.status = "failed"
+                    execution.log = '\n'.join(log_lines)
+                    execution.error_message = error_msg
                     session.commit()
         finally:
             if execution_id in self.active_processes:
@@ -228,24 +451,31 @@ class ETLService:
 
             progress_pct = (completed_jobs / total_jobs * 100) if total_jobs > 0 else 0
 
+            # Calcular elapsed time
+            elapsed_time = 0
+            if execution.started_at:
+                end_time = execution.finished_at or datetime.utcnow()
+                elapsed_time = int((end_time - execution.started_at).total_seconds())
+
             return {
                 "execution_id": str(execution.id),
-                "process_type": execution.process_type,
+                "execution_type": execution.execution_type,
                 "entity": execution.entity,
                 "year": execution.year,
                 "status": execution.status,
                 "started_at": execution.started_at.isoformat() if execution.started_at else None,
                 "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
-                "progress": {
-                    "total_jobs": total_jobs,
-                    "completed": completed_jobs,
-                    "failed": failed_jobs,
-                    "running": total_jobs - completed_jobs - failed_jobs,
-                    "percentage": round(progress_pct, 2)
-                },
-                "stats": execution.stats or {},
-                "config": execution.config or {},
-                "error": execution.error
+                "entrypoint": execution.entrypoint,
+                "current_phase": execution.current_phase,
+                "current_operation": execution.current_operation,
+                "progress": execution.progress_percentage or progress_pct,
+                "elapsed_time": elapsed_time,
+                "records_processed": execution.records_processed or 0,
+                "records_inserted": execution.records_inserted or 0,
+                "records_updated": execution.records_updated or 0,
+                "records_errors": execution.records_errors or 0,
+                "error_message": execution.error_message,
+                "log": execution.log
             }
 
     def list_recent_executions(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -262,20 +492,37 @@ class ETLService:
             for execution in executions:
                 # Calcular duración
                 duration = None
-                if execution.started_at and execution.finished_at:
-                    delta = execution.finished_at - execution.started_at
-                    duration = delta.total_seconds()
+                elapsed_time = 0
+                if execution.started_at:
+                    end_time = execution.finished_at or datetime.utcnow()
+                    elapsed_time = int((end_time - execution.started_at).total_seconds())
+                    if execution.finished_at:
+                        duration = elapsed_time
 
                 result.append({
                     "execution_id": str(execution.id),
-                    "process_type": execution.process_type,
+                    "execution_type": execution.execution_type,
                     "entity": execution.entity,
                     "year": execution.year,
                     "status": execution.status,
                     "started_at": execution.started_at.isoformat() if execution.started_at else None,
                     "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
                     "duration_seconds": duration,
-                    "stats": execution.stats or {}
+                    "elapsed_time": elapsed_time,
+                    "entrypoint": execution.entrypoint,
+                    "current_phase": execution.current_phase,
+                    "progress": execution.progress_percentage or 0,
+                    "records_processed": execution.records_processed or 0,
+                    "records_inserted": execution.records_inserted or 0,
+                    "records_updated": execution.records_updated or 0,
+                    "records_errors": execution.records_errors or 0,
+                    "log": execution.log,
+                    "stats": {
+                        "records_processed": execution.records_processed or 0,
+                        "records_inserted": execution.records_inserted or 0,
+                        "records_updated": execution.records_updated or 0,
+                        "records_errors": execution.records_errors or 0
+                    }
                 })
 
             return result
@@ -285,18 +532,27 @@ class ETLService:
         with get_session() as session:
             # Total executions por tipo
             seeding_count = session.execute(
-                select(func.count(EtlExecution.id)).where(EtlExecution.process_type == "seeding")
+                select(func.count(EtlExecution.id)).where(EtlExecution.execution_type == "seeding")
             ).scalar()
 
             sync_count = session.execute(
-                select(func.count(EtlExecution.id)).where(EtlExecution.process_type == "sync")
+                select(func.count(EtlExecution.id)).where(EtlExecution.execution_type == "sync")
+            ).scalar()
+
+            # Contar por estado
+            completed_count = session.execute(
+                select(func.count(EtlExecution.id)).where(EtlExecution.status == "completed")
+            ).scalar()
+
+            failed_count = session.execute(
+                select(func.count(EtlExecution.id)).where(EtlExecution.status == "failed")
             ).scalar()
 
             # Últimas ejecuciones exitosas
             last_seeding = session.execute(
                 select(EtlExecution)
                 .where(
-                    EtlExecution.process_type == "seeding",
+                    EtlExecution.execution_type == "seeding",
                     EtlExecution.status == "completed"
                 )
                 .order_by(desc(EtlExecution.finished_at))
@@ -306,7 +562,7 @@ class ETLService:
             last_sync = session.execute(
                 select(EtlExecution)
                 .where(
-                    EtlExecution.process_type == "sync",
+                    EtlExecution.execution_type == "sync",
                     EtlExecution.status == "completed"
                 )
                 .order_by(desc(EtlExecution.finished_at))
@@ -322,7 +578,9 @@ class ETLService:
                 "total_executions": {
                     "seeding": seeding_count,
                     "sync": sync_count,
-                    "total": seeding_count + sync_count
+                    "total": seeding_count + sync_count,
+                    "completed": completed_count,
+                    "failed": failed_count
                 },
                 "last_successful": {
                     "seeding": last_seeding.finished_at.isoformat() if last_seeding and last_seeding.finished_at else None,
@@ -330,6 +588,43 @@ class ETLService:
                 },
                 "active_processes": active_count
             }
+
+    def list_active_executions(self) -> List[Dict[str, Any]]:
+        """Lista las ejecuciones actualmente en curso con detalles completos."""
+        with get_session() as session:
+            stmt = (
+                select(EtlExecution)
+                .where(EtlExecution.status == "running")
+                .order_by(desc(EtlExecution.started_at))
+            )
+            executions = session.execute(stmt).scalars().all()
+
+            result = []
+            for execution in executions:
+                elapsed_time = 0
+                if execution.started_at:
+                    elapsed_time = int((datetime.utcnow() - execution.started_at).total_seconds())
+
+                result.append({
+                    "execution_id": str(execution.id),
+                    "execution_type": execution.execution_type,
+                    "entity": execution.entity,
+                    "year": execution.year,
+                    "status": execution.status,
+                    "started_at": execution.started_at.isoformat() if execution.started_at else None,
+                    "entrypoint": execution.entrypoint,
+                    "current_phase": execution.current_phase,
+                    "current_operation": execution.current_operation,
+                    "progress": execution.progress_percentage or 0,
+                    "elapsed_time": elapsed_time,
+                    "records_processed": execution.records_processed or 0,
+                    "records_inserted": execution.records_inserted or 0,
+                    "records_updated": execution.records_updated or 0,
+                    "records_errors": execution.records_errors or 0,
+                    "log": execution.log
+                })
+
+            return result
 
     def get_sync_control_status(self) -> List[Dict[str, Any]]:
         """Obtiene el estado de sincronización por entidad."""

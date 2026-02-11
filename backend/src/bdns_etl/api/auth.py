@@ -1,108 +1,36 @@
 """
 Router de autenticación para ETL Admin.
 
+Usa autenticación centralizada de bdns_core con base de datos.
+
 Endpoints:
 - POST /login - Login con username/password
 - POST /refresh - Renovar access token con refresh token
 - GET /me - Obtener usuario actual
+- GET /verify - Verificar token
 """
 from fastapi import APIRouter, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+# Importar TODO desde bdns_core (ya no hay duplicación)
 from bdns_core.auth import (
+    LoginRequest,
     Token,
+    TokenRefresh,
     UserInToken,
+    UserResponse,
     create_token_pair,
     refresh_access_token,
     verify_password,
     verify_token,
+    get_current_user,
+    require_admin,
+    UserService,
 )
+from bdns_core.db.session import get_db
 
 
 router = APIRouter()
-security = HTTPBearer()
-
-
-# ==========================================
-# SCHEMAS
-# ==========================================
-
-class LoginRequest(BaseModel):
-    """Request de login."""
-    username: str
-    password: str
-
-
-class RefreshRequest(BaseModel):
-    """Request para refresh token."""
-    refresh_token: str
-
-
-class UserResponse(BaseModel):
-    """Response con datos de usuario."""
-    username: str
-    role: str
-
-
-# ==========================================
-# USUARIOS HARDCODED (temporal)
-# TODO: Mover a base de datos
-# ==========================================
-
-# Passwords hasheados con bcrypt
-# admin: "admin123"
-# user: "user123"
-FAKE_USERS_DB = {
-    "admin": {
-        "username": "admin",
-        "hashed_password": "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYzpLaOvzK6",  # admin123
-        "role": "admin"
-    },
-    "user": {
-        "username": "user",
-        "hashed_password": "$2b$12$gPuKVw5CQXQY7kv5QfH.SeMKfV6yVqH8p3yH8KfV6yVqH8p3yH8Kf",  # user123
-        "role": "user"
-    }
-}
-
-
-# ==========================================
-# DEPENDENCIAS
-# ==========================================
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserInToken:
-    """
-    Dependency para obtener usuario actual desde JWT token.
-
-    Extrae el token del header Authorization: Bearer <token>
-    y verifica su validez.
-    """
-    token = credentials.credentials
-    user = verify_token(token)
-
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token inválido o expirado",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    return user
-
-
-async def require_admin(current_user: UserInToken = Depends(get_current_user)) -> UserInToken:
-    """
-    Dependency para requerir rol de admin.
-
-    Lanza excepción si el usuario no es admin.
-    """
-    if current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acceso denegado: se requiere rol de admin"
-        )
-    return current_user
 
 
 # ==========================================
@@ -110,38 +38,40 @@ async def require_admin(current_user: UserInToken = Depends(get_current_user)) -
 # ==========================================
 
 @router.post("/login", response_model=Token)
-async def login(request: LoginRequest):
+async def login(request: LoginRequest, db: Session = Depends(get_db)):
     """
     Login con username y password.
 
     Retorna access_token y refresh_token si las credenciales son correctas.
+    Ahora usa base de datos en lugar de memoria.
     """
-    # Buscar usuario
-    user = FAKE_USERS_DB.get(request.username)
+    # DEBUG: Log de credenciales recibidas
+    print(f"🔐 Login attempt: username='{request.username}', password_length={len(request.password)}")
+
+    # Autenticar usuario contra base de datos
+    user = UserService.authenticate_user(db, request.username, request.password)
+
+    # DEBUG: Log resultado
+    print(f"🔐 Auth result: {'SUCCESS' if user else 'FAILED'}")
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario o contraseña incorrectos"
-        )
-
-    # Verificar password
-    if not verify_password(request.password, user["hashed_password"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario o contraseña incorrectos"
+            detail="Usuario o contraseña incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     # Crear tokens
     tokens = create_token_pair(
-        username=user["username"],
-        role=user["role"]
+        username=user.username,
+        role=user.role
     )
 
     return tokens
 
 
 @router.post("/refresh")
-async def refresh(request: RefreshRequest):
+async def refresh(request: TokenRefresh):
     """
     Renueva el access token usando un refresh token válido.
 
@@ -152,7 +82,8 @@ async def refresh(request: RefreshRequest):
     if new_access_token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token inválido o expirado"
+            detail="Refresh token inválido o expirado",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     return {
@@ -162,15 +93,36 @@ async def refresh(request: RefreshRequest):
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(current_user: UserInToken = Depends(get_current_user)):
+async def get_me(
+    current_user: UserInToken = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
-    Obtiene información del usuario actual.
+    Obtiene información del usuario actual desde la base de datos.
 
     Requiere autenticación (token JWT en header).
     """
+    # Obtener usuario completo desde BD
+    user = UserService.get_user_by_username(db, current_user.username)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuario no encontrado"
+        )
+
     return UserResponse(
-        username=current_user.username,
-        role=current_user.role
+        id=str(user.id),
+        username=user.username,
+        email=user.email,
+        nombre=user.nombre,
+        role=user.role,
+        activo=user.activo,
+        telegram_chat_id=user.telegram_chat_id,
+        telegram_username=user.telegram_username,
+        telegram_verificado=user.telegram_verificado,
+        created_at=user.created_at,
+        updated_at=user.updated_at,
     )
 
 

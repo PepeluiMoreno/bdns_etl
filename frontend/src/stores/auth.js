@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import axios from 'axios'
 
-const API_URL = '/api/auth'
+const API_URL = `${import.meta.env.VITE_API_ENDPOINT}/auth`
 
 export const useAuthStore = defineStore('auth', () => {
   // State

@@ -1,0 +1,78 @@
+<template>
+  <div class="px-3 py-4 border-t border-gray-700">
+    <div class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3 px-3">
+      Estado del sistema
+    </div>
+
+    <!-- Backend -->
+    <div class="flex items-center px-3 py-1.5 text-sm">
+      <span
+        class="w-2 h-2 rounded-full mr-2 flex-shrink-0"
+        :class="systemStore.backendOnline ? 'bg-green-400' : 'bg-red-500'"
+      ></span>
+      <span class="text-gray-400 text-xs">Backend</span>
+      <span class="ml-auto text-xs" :class="systemStore.backendOnline ? 'text-green-400' : 'text-red-400'">
+        {{ systemStore.backendOnline ? 'Conectado' : 'Desconectado' }}
+      </span>
+    </div>
+
+    <!-- Base de datos -->
+    <div class="flex items-center px-3 py-1.5 text-sm">
+      <span
+        class="w-2 h-2 rounded-full mr-2 flex-shrink-0"
+        :class="systemStore.databaseOnline ? 'bg-green-400' : 'bg-red-500'"
+      ></span>
+      <span class="text-gray-400 text-xs">Base de datos</span>
+      <span class="ml-auto text-xs" :class="systemStore.databaseOnline ? 'text-green-400' : 'text-red-400'">
+        {{ systemStore.databaseOnline ? 'OK' : 'Sin conexion' }}
+      </span>
+    </div>
+
+    <!-- Catalogos -->
+    <div class="flex items-center px-3 py-1.5 text-sm">
+      <span
+        class="w-2 h-2 rounded-full mr-2 flex-shrink-0"
+        :class="catalogoStatusColor"
+      ></span>
+      <span class="text-gray-400 text-xs">Catalogos</span>
+      <span class="ml-auto text-xs" :class="catalogoStatusTextColor">
+        {{ catalogoStatusText }}
+      </span>
+    </div>
+
+    <!-- Loading indicator -->
+    <div v-if="systemStore.loading" class="px-3 mt-1">
+      <span class="text-xs text-gray-500">Comprobando...</span>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+import { useSystemStore } from '@/stores/system'
+
+const systemStore = useSystemStore()
+
+const catalogoStatusColor = computed(() => {
+  if (!systemStore.databaseOnline) return 'bg-gray-500'
+  if (systemStore.catalogosInicializados) return 'bg-green-400'
+  if (systemStore.catalogosOk.length > 0) return 'bg-amber-400'
+  return 'bg-red-500'
+})
+
+const catalogoStatusTextColor = computed(() => {
+  if (!systemStore.databaseOnline) return 'text-gray-500'
+  if (systemStore.catalogosInicializados) return 'text-green-400'
+  if (systemStore.catalogosOk.length > 0) return 'text-amber-400'
+  return 'text-red-400'
+})
+
+const catalogoStatusText = computed(() => {
+  if (!systemStore.databaseOnline) return '-'
+  if (systemStore.catalogosInicializados) return 'OK'
+  const ok = systemStore.catalogosOk.length
+  const total = systemStore.totalCatalogos
+  if (total === 0) return 'Sin datos'
+  return `${ok}/${total}`
+})
+</script>

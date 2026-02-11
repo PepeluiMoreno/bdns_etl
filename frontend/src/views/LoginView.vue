@@ -1,54 +1,43 @@
 <template>
-  <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-500 to-purple-600">
-    <div class="bg-white p-8 rounded-lg shadow-2xl w-full max-w-md">
-      <div class="text-center mb-8">
-        <h1 class="text-3xl font-bold text-gray-800">BDNS ETL Admin</h1>
-        <p class="text-gray-600 mt-2">Administración de procesos ETL</p>
+  <div class="login-container">
+    <div class="login-panel">
+      <div class="login-header">
+        <h1>BDNS Portal</h1>
+        <p>Administración de los procesos de Extracción y Sincronización</p>
       </div>
 
-      <form @submit.prevent="handleLogin" class="space-y-6">
-        <div>
-          <label for="username" class="block text-sm font-medium text-gray-700">Usuario</label>
+      <form @submit.prevent="handleLogin">
+        <div class="form-group">
+          <label for="username">Usuario</label>
           <input
             id="username"
             v-model="username"
             type="text"
             required
-            class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
             placeholder="admin"
           />
         </div>
 
-        <div>
-          <label for="password" class="block text-sm font-medium text-gray-700">Contraseña</label>
+        <div class="form-group">
+          <label for="password">Contraseña</label>
           <input
             id="password"
             v-model="password"
             type="password"
             required
-            class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
             placeholder="••••••••"
           />
         </div>
 
-        <div v-if="error" class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
+        <div v-if="error" class="error-message">
           {{ error }}
         </div>
 
-        <button
-          type="submit"
-          :disabled="loading"
-          class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
-        >
+        <button type="submit" :disabled="loading" class="submit-button">
           <span v-if="loading">Iniciando sesión...</span>
           <span v-else>Iniciar sesión</span>
         </button>
       </form>
-
-      <div class="mt-6 text-center text-sm text-gray-600">
-        <p>Usuario de prueba: <code class="bg-gray-100 px-2 py-1 rounded">admin</code></p>
-        <p>Contraseña: <code class="bg-gray-100 px-2 py-1 rounded">admin123</code></p>
-      </div>
     </div>
   </div>
 </template>
@@ -82,3 +71,113 @@ async function handleLogin() {
   }
 }
 </script>
+
+<style scoped>
+.login-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 20px;
+  background: linear-gradient(135deg, #1a1a1a 0%, #0a0a0a 100%);
+}
+
+.login-panel {
+  background-color: var(--bg-secondary);
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  padding: 40px;
+  width: 400px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+@media (max-width: 480px) {
+  .login-panel {
+    width: calc(100vw - 40px);
+  }
+}
+
+.login-header {
+  text-align: center;
+  margin-bottom: 32px;
+}
+
+.login-header h1 {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.login-header p {
+  font-size: 14px;
+  color: var(--text-secondary);
+}
+
+.form-group {
+  margin-bottom: 24px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.form-group input {
+  width: 100%;
+  padding: 10px 12px;
+  background-color: var(--bg-tertiary);
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.form-group input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px rgba(74, 158, 255, 0.2);
+}
+
+.form-group input::placeholder {
+  color: #666666;
+}
+
+.error-message {
+  margin-bottom: 20px;
+  padding: 12px 16px;
+  background-color: rgba(255, 68, 68, 0.1);
+  border: 1px solid rgba(255, 68, 68, 0.3);
+  border-radius: 6px;
+  color: var(--accent-red);
+  font-size: 13px;
+}
+
+.submit-button {
+  padding: 12px 24px;
+  background-color: var(--accent-blue);
+  border: none;
+  border-radius: 6px;
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  align-self: center;
+}
+
+.submit-button:hover:not(:disabled) {
+  background-color: #3a8eef;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(74, 158, 255, 0.3);
+}
+
+.submit-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+</style>

@@ -10,7 +10,8 @@ from bdns_core.db.models import (
     Convocatoria, Instrumento, TipoBeneficiario, Finalidad, Objetivo, Organo,
     Reglamento, Fondo, Region, SectorActividad, SectorProducto
 )
-from ETL.etl_utils import get_or_create_dir
+# Directorio base para datos generados
+_BASE_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 logger = logging.getLogger("load_convocatorias_from_json")
 if not logger.hasHandlers():
@@ -20,9 +21,10 @@ if not logger.hasHandlers():
     )
 
 def registrar_pendiente(nombre_catalogo, descripcion):
-    """Registra un valor pendiente (sin duplicados) en ETL/convocatorias/pending/<catalogo>_pending.csv."""
-    pending_dir = get_or_create_dir("ETL", "convocatorias", "pending")
-    pending_file = Path(pending_dir) / f"{nombre_catalogo}_pending.csv"
+    """Registra un valor pendiente (sin duplicados) en data/convocatorias/pending/<catalogo>_pending.csv."""
+    pending_dir = _BASE_DATA_DIR / "convocatorias" / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_file = pending_dir / f"{nombre_catalogo}_pending.csv"
     if not hasattr(registrar_pendiente, "vistos"):
         registrar_pendiente.vistos = set()
     clave = (nombre_catalogo, str(descripcion))
@@ -38,8 +40,8 @@ def load_convocatorias_from_json(json_path, csv_path):
     Marca como 'loaded' en el CSV las que se cargan.
     Devuelve completadas, pendientes.
     """
-    get_or_create_dir("ETL", "convocatorias", "pending")
-    get_or_create_dir("logs")
+    (_BASE_DATA_DIR / "convocatorias" / "pending").mkdir(parents=True, exist_ok=True)
+    (_BASE_DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
 
     json_path = Path(json_path)
     if not json_path.exists():

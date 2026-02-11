@@ -1,0 +1,84 @@
+version: '3.8'
+
+secrets:
+  admin_username:
+    file: ./secrets/admin_username.txt
+  admin_password_hash:
+    file: ./secrets/admin_password_hash.txt
+  user_username:
+    file: ./secrets/user_username.txt
+  user_password_hash:
+    file: ./secrets/user_password_hash.txt
+
+services:
+  # Opción 1: Conectar a PostgreSQL existente (si bdns_portal está corriendo)
+  # No necesitas definir postgres aquí, usa el que corre en bdns_network
+
+  # Opción 2: PostgreSQL propio (comentado - usa el de bdns_portal en puerto 5244)
+  # postgres:
+  #   image: postgis/postgis:16-3.4
+  #   container_name: bdns_postgres
+  #   environment:
+  #     POSTGRES_DB: bdns
+  #     POSTGRES_USER: bdns_user
+  #     POSTGRES_PASSWORD: bdns_password
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   networks:
+  #     - bdns_network
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U bdns_user -d bdns"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # Backend FastAPI
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bdns_etl_backend
+    ports:
+      - "8001:8001"
+    environment:
+      # Conectar al PostgreSQL existente en puerto 5244
+      DATABASE_URL: postgresql://bdns:bdns@host.docker.internal:5244/bdns
+      JWT_SECRET_KEY: changeme-in-production
+    secrets:
+      - admin_username
+      - admin_password_hash
+      - user_username
+      - user_password_hash
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - bdns_network
+    volumes:
+      - ./backend:/app
+      - ./seeding:/app/seeding
+      - ./sync:/app/sync
+      - ../bdns_core/bdns_core:/app/bdns_core_package
+
+  # Frontend Vue3 (opcional - puedes ejecutarlo manualmente)
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: bdns_etl_frontend
+  #   ports:
+  #     - "3001:80"
+  #   depends_on:
+  #     - backend
+  #   networks:
+  #     - bdns_network
+
+volumes:
+  postgres_data:
+    name: bdns_postgres_data  # Mismo volumen que bdns_portal
+
+networks:
+  bdns_network:
+    name: bdns_network  # Misma red que bdns_portal
+    driver: bridge

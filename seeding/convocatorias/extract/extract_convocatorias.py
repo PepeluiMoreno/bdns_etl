@@ -1,13 +1,13 @@
-# ETL/convocatorias/extract/extract_convocatorias.py
+# seeding/convocatorias/extract/extract_convocatorias.py
 
 
 import json
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from ETL.etl_utils import get_or_create_dir
 
-RUTA_RAW = get_or_create_dir("json", "convocatorias", "raw")
+RUTA_RAW = Path(__file__).resolve().parent.parent.parent / "data" / "json" / "convocatorias" / "raw"
+RUTA_RAW.mkdir(parents=True, exist_ok=True)
 
 def fetch_convocatoria(codigo: str):
     url = f"https://www.infosubvenciones.es/bdnstrans/api/convocatorias?numConv={codigo}"

@@ -12,27 +12,38 @@ const router = createRouter({
     },
     {
       path: '/',
-      name: 'Dashboard',
-      component: () => import('@/views/DashboardView.vue'),
-      meta: { requiresAuth: true }
-    },
-    {
-      path: '/seeding',
-      name: 'Seeding',
-      component: () => import('@/views/SeedingView.vue'),
-      meta: { requiresAuth: true, requiresAdmin: true }
-    },
-    {
-      path: '/sync',
-      name: 'Sync',
-      component: () => import('@/views/SyncView.vue'),
-      meta: { requiresAuth: true, requiresAdmin: true }
-    },
-    {
-      path: '/executions',
-      name: 'Executions',
-      component: () => import('@/views/ExecutionsView.vue'),
-      meta: { requiresAuth: true }
+      component: () => import('@/layouts/DashboardLayout.vue'),
+      meta: { requiresAuth: true },
+      children: [
+        {
+          path: '',
+          name: 'Dashboard',
+          redirect: '/poblamiento'
+        },
+        {
+          path: 'poblamiento',
+          name: 'Poblamiento',
+          component: () => import('@/views/PoblamientoView.vue'),
+          meta: { requiresAdmin: true }
+        },
+        {
+          path: 'seeding',
+          name: 'Seeding',
+          component: () => import('@/views/SeedingView.vue'),
+          meta: { requiresAdmin: true }
+        },
+        {
+          path: 'sync',
+          name: 'Sync',
+          component: () => import('@/views/SyncView.vue'),
+          meta: { requiresAdmin: true }
+        },
+        {
+          path: 'processes',
+          name: 'Processes',
+          component: () => import('@/views/ProcessesView.vue')
+        }
+      ]
     }
   ]
 })

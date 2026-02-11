@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""
+Script ETL real que integra los extractores existentes.
+
+Ejecuta procesos ETL de poblamiento real llamando a los extractores
+que ya existen en bdns_etl/seeding/.
+
+Actualiza progreso en base de datos y genera logs en tiempo real.
+"""
+import sys
+import argparse
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from uuid import UUID
+
+# Agregar rutas al path
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+SEEDING_DIR = PROJECT_ROOT / "bdns_etl" / "seeding"
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SEEDING_DIR))
+
+from bdns_core.db.session import get_session
+from bdns_core.db.etl_models import EtlExecution
+from etl_progress_reporter import ETLProgressReporter
+
+# Importar loader de concesiones
+sys.path.insert(0, str(SEEDING_DIR / "common"))
+from load_concesiones_from_json import load_json_to_concesiones
+
+
+def log(message: str):
+    """Print log con timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
+def extract_convocatorias(year: int, execution_id: UUID, reporter: ETLProgressReporter):
+    """
+    Extrae convocatorias para un año: Extract → Transform → Load (COPY).
+
+    Pipeline:
+    1. Genera CSV de control con códigos BDNS (extract_control_csv)
+    2. Descarga detalle JSON de cada convocatoria (fetch_convocatoria)
+    3. Transforma JSON a CSV con resolución de FKs (transform_convocatorias_to_csv)
+    4. Carga CSV a BD via COPY + ON CONFLICT (copy_convocatorias)
+
+    Requiere catálogos (órganos, reglamentos) poblados al 100%.
+    """
+    log("=" * 60)
+    log(f"INICIANDO EXTRACCIÓN DE CONVOCATORIAS - AÑO {year}")
+    log("=" * 60)
+
+    try:
+        # ── PASO 1: CSV de control (códigos BDNS del año) ──
+        reporter.set_phase("extracting", "Generando CSV de control con códigos BDNS")
+        reporter.update_progress(5)
+
+        sys.path.insert(0, str(SEEDING_DIR / "convocatorias"))
+        from extract_control_csv import fetch_codigos_bdns, merge_and_cleanup, TIPOS
+
+        control_dir = SEEDING_DIR / "control"
+        control_dir.mkdir(parents=True, exist_ok=True)
+
+        log(f"INFO: Extrayendo códigos BDNS para los 4 tipos de administración...")
+        for tipo in TIPOS:
+            csv_path = control_dir / f"convocatoria_{year}_{tipo}.csv"
+            log(f"INFO: Tipo {tipo} - extrayendo códigos...")
+            fetch_codigos_bdns(year, tipo, csv_path)
+
+        merge_and_cleanup(year, control_dir)
+        reporter.update_progress(25)
+
+        # Leer CSV anual → códigos pendientes
+        import csv as csv_mod
+        csv_anual = control_dir / f"convocatoria_{year}.csv"
+        codigos_pendientes = []
+        if csv_anual.exists():
+            with open(csv_anual, encoding="utf-8") as f:
+                reader = csv_mod.DictReader(f)
+                for row in reader:
+                    if row.get("status") == "pending":
+                        codigos_pendientes.append(row["codigo_bdns"])
+
+        total_codigos = len(codigos_pendientes)
+        log(f"INFO: {total_codigos} convocatorias pendientes de descargar")
+        reporter.update_progress(30, records_processed=total_codigos)
+
+        if total_codigos == 0:
+            log("INFO: No hay convocatorias pendientes, todas ya están procesadas")
+            reporter.complete(records_processed=0, records_inserted=0, records_updated=0, records_errors=0)
+            return 0
+
+        # ── PASO 2: Extract – descargar detalle de cada convocatoria ──
+        reporter.set_phase("extracting", "Descargando detalle de convocatorias desde API BDNS")
+        from convocatorias.extract.extract_convocatorias import fetch_convocatoria
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        resultados = []
+        errores_extract = 0
+        workers = min(6, total_codigos)
+
+        log(f"INFO: Descargando {total_codigos} convocatorias con {workers} workers...")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fetch_convocatoria, c): c for c in codigos_pendientes}
+            for i, future in enumerate(as_completed(futures), 1):
+                try:
+                    result = future.result()
+                    resultados.extend(result)
+                except Exception as e:
+                    errores_extract += 1
+                    log(f"WARNING: Error descargando {futures[future]}: {e}")
+
+                if i % 100 == 0:
+                    pct = 30 + int((i / total_codigos) * 30)
+                    reporter.update_progress(pct, records_processed=i)
+                    log(f"INFO: {i}/{total_codigos} convocatorias descargadas...")
+
+        log(f"INFO: {len(resultados)} convocatorias descargadas, {errores_extract} errores de API")
+        reporter.update_progress(60, records_processed=len(resultados))
+
+        # Guardar JSON raw
+        import json as json_mod
+        raw_dir = SEEDING_DIR / "data" / "json" / "convocatorias" / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        json_path = raw_dir / f"raw_convocatorias_{year}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json_mod.dump(resultados, f, ensure_ascii=False, indent=2)
+        log(f"INFO: JSON guardado en {json_path}")
+
+        # ── PASO 3: Transform – JSON → CSV pipe-separated con FK resolution ──
+        reporter.set_phase("transforming", "Transformando JSON a CSV con resolución de FKs")
+        reporter.update_progress(65)
+
+        from convocatorias.transform.transform_convocatorias_to_csv import transform_convocatorias_to_csv
+
+        csv_dir = SEEDING_DIR / "data" / "csv" / "convocatorias"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_output = csv_dir / f"convocatorias_{year}.csv"
+
+        transform_stats = transform_convocatorias_to_csv(json_path, csv_output)
+        log(f"INFO: Transform completado: {transform_stats['transformados']}/{transform_stats['total']} "
+            f"({transform_stats['sin_organo']} sin órgano, {transform_stats['sin_reglamento']} sin reglamento)")
+        reporter.update_progress(80, records_processed=transform_stats['transformados'])
+
+        # ── PASO 4: Load – CSV → BD via COPY ──
+        reporter.set_phase("loading", "Cargando convocatorias en BD via COPY")
+        reporter.update_progress(85)
+
+        from convocatorias.load.load_convocatorias_copy import copy_convocatorias
+
+        insertados, duplicados = copy_convocatorias(csv_output)
+        log(f"INFO: COPY completado: {insertados} insertadas, {duplicados} duplicadas")
+
+        # Actualizar CSV de control: marcar códigos como loaded
+        if csv_anual.exists():
+            with open(csv_anual, encoding="utf-8", newline="") as f:
+                reader = csv_mod.DictReader(f)
+                rows = list(reader)
+                fieldnames = reader.fieldnames
+            codigos_cargados = {str(r.get("codigo_bdns") or r.get("numeroConvocatoria") or r.get("id")) for r in resultados}
+            for row in rows:
+                if row.get("codigo_bdns") in codigos_cargados:
+                    row["status"] = "loaded"
+            with open(csv_anual, "w", encoding="utf-8", newline="") as f:
+                writer = csv_mod.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        reporter.update_progress(95, records_processed=transform_stats['transformados'], records_inserted=insertados)
+
+        reporter.complete(
+            records_processed=transform_stats['transformados'],
+            records_inserted=insertados,
+            records_updated=0,
+            records_errors=errores_extract + transform_stats['errores']
+        )
+
+        log(f"SUCCESS: Convocatorias extraídas correctamente ({insertados} insertadas, {duplicados} duplicadas)")
+        return 0
+
+    except Exception as e:
+        log(f"ERROR: Fallo en extracción de convocatorias: {e}")
+        import traceback
+        traceback.print_exc()
+        reporter.fail(str(e))
+        return 1
+
+
+def extract_concesiones(year: int, execution_id: UUID, reporter: ETLProgressReporter, entity_type: str = "ordinarias"):
+    """
+    Extrae concesiones usando los extractores existentes.
+
+    Args:
+        year: Año a procesar
+        execution_id: ID de ejecución
+        reporter: Reporter de progreso
+        entity_type: Tipo de concesión (ordinarias, minimis, ayudas_estado, partidos_politicos)
+    """
+    log("=" * 60)
+    log(f"INICIANDO EXTRACCIÓN DE {entity_type.upper()} - AÑO {year}")
+    log("=" * 60)
+
+    try:
+        reporter.set_phase("initializing", f"Inicializando extractor de {entity_type}")
+        reporter.update_progress(5)
+
+        # Importar el extractor apropiado
+        if entity_type == "minimis":
+            from minimis.extract_minimis import MinimisExtractor
+
+            reporter.set_phase("extracting", "Descargando ayudas de minimis desde API BDNS")
+            reporter.update_progress(10)
+
+            log(f"INFO: Extrayendo ayudas de minimis para año {year}")
+
+            extractor = MinimisExtractor(output_dir=SEEDING_DIR / "minimis" / "data")
+            data = extractor.extract_minimis_by_year(year)
+
+            reporter.update_progress(60, records_processed=len(data))
+
+            log(f"INFO: Guardando {len(data)} registros de minimis")
+            json_path = SEEDING_DIR / "minimis" / "data" / f"minimis_{year}.json"
+            extractor.save_to_json(data, year)
+
+            reporter.set_phase("loading", "Cargando minimis a base de datos")
+            reporter.update_progress(80, records_processed=len(data))
+
+            # Cargar a BD
+            log(f"INFO: Cargando JSON a base de datos...")
+            stats = load_json_to_concesiones(json_path, "minimis", batch_size=1000)
+
+            reporter.complete(
+                records_processed=stats['procesados'],
+                records_inserted=stats['concesiones_insertadas'],
+                records_updated=0,
+                records_errors=stats['errores']
+            )
+
+            log(f"SUCCESS: {stats['concesiones_insertadas']} ayudas de minimis insertadas en BD")
+            return 0
+
+        elif entity_type == "ayudas_estado":
+            from ayudas_estado.extract_ayudas_estado import AyudasEstadoExtractor
+
+            reporter.set_phase("extracting", "Descargando ayudas de estado desde API BDNS")
+            reporter.update_progress(10)
+
+            log(f"INFO: Extrayendo ayudas de estado para año {year}")
+
+            extractor = AyudasEstadoExtractor(output_dir=SEEDING_DIR / "ayudas_estado" / "data")
+            data = extractor.extract_ayudas_by_year(year)
+
+            reporter.update_progress(60, records_processed=len(data))
+
+            log(f"INFO: Guardando {len(data)} registros de ayudas de estado")
+            json_path = SEEDING_DIR / "ayudas_estado" / "data" / f"ayudas_estado_{year}.json"
+            extractor.save_to_json(data, year)
+
+            reporter.set_phase("loading", "Cargando ayudas de estado a base de datos")
+            reporter.update_progress(80, records_processed=len(data))
+
+            # Cargar a BD
+            log(f"INFO: Cargando JSON a base de datos...")
+            stats = load_json_to_concesiones(json_path, "ayuda_estado", batch_size=1000)
+
+            reporter.complete(
+                records_processed=stats['procesados'],
+                records_inserted=stats['concesiones_insertadas'],
+                records_updated=0,
+                records_errors=stats['errores']
+            )
+
+            log(f"SUCCESS: {stats['concesiones_insertadas']} ayudas de estado insertadas en BD")
+            return 0
+
+        elif entity_type == "partidos_politicos":
+            from partidos_politicos.extract_partidos_politicos import PartidosPoliticosExtractor
+
+            reporter.set_phase("extracting", "Descargando ayudas a partidos políticos desde API BDNS")
+            reporter.update_progress(10)
+
+            log(f"INFO: Extrayendo ayudas a partidos políticos para año {year}")
+
+            extractor = PartidosPoliticosExtractor(output_dir=SEEDING_DIR / "partidos_politicos" / "data")
+            data = extractor.extract_partidos_by_year(year)
+
+            reporter.update_progress(60, records_processed=len(data))
+
+            log(f"INFO: Guardando {len(data)} registros de partidos políticos")
+            json_path = SEEDING_DIR / "partidos_politicos" / "data" / f"partidos_politicos_{year}.json"
+            extractor.save_to_json(data, year)
+
+            reporter.set_phase("loading", "Cargando partidos políticos a base de datos")
+            reporter.update_progress(80, records_processed=len(data))
+
+            # Cargar a BD
+            log(f"INFO: Cargando JSON a base de datos...")
+            stats = load_json_to_concesiones(json_path, "partidos_politicos", batch_size=1000)
+
+            reporter.complete(
+                records_processed=stats['procesados'],
+                records_inserted=stats['concesiones_insertadas'],
+                records_updated=0,
+                records_errors=stats['errores']
+            )
+
+            log(f"SUCCESS: {stats['concesiones_insertadas']} ayudas a partidos políticos insertadas en BD")
+            return 0
+
+        elif entity_type == "grandes_beneficiarios":
+            from grandes_beneficiarios.extract_grandes_beneficiarios import GrandesBeneficiariosExtractor
+
+            reporter.set_phase("extracting", "Descargando grandes beneficiarios desde API BDNS")
+            reporter.update_progress(10)
+
+            log(f"INFO: Extrayendo grandes beneficiarios para año {year}")
+
+            extractor = GrandesBeneficiariosExtractor(output_dir=SEEDING_DIR / "grandes_beneficiarios" / "data")
+            data = extractor.extract_grandes_beneficiarios_by_year(year)
+
+            reporter.update_progress(60, records_processed=len(data))
+
+            log(f"INFO: Guardando {len(data)} registros de grandes beneficiarios")
+            extractor.save_to_json(data, year)
+
+            reporter.set_phase("loading", "Cargando grandes beneficiarios a base de datos")
+            reporter.update_progress(80, records_processed=len(data))
+
+            # Cargar a BD
+            json_path = SEEDING_DIR / "grandes_beneficiarios" / "data" / f"grandes_beneficiarios_{year}.json"
+            log(f"INFO: Cargando JSON a base de datos...")
+            stats = load_json_to_concesiones(json_path, "grandes_beneficiarios", batch_size=1000)
+
+            reporter.complete(
+                records_processed=stats['procesados'],
+                records_inserted=stats['concesiones_insertadas'],
+                records_updated=0,
+                records_errors=stats['errores']
+            )
+
+            log(f"SUCCESS: {stats['concesiones_insertadas']} grandes beneficiarios insertados en BD")
+            return 0
+
+        else:
+            log(f"ERROR: Tipo de concesión no soportado: {entity_type}")
+            reporter.fail(f"Tipo de concesión no soportado: {entity_type}")
+            return 1
+
+    except Exception as e:
+        log(f"ERROR: Fallo en extracción de {entity_type}: {e}")
+        import traceback
+        traceback.print_exc()
+        reporter.fail(str(e))
+        return 1
+
+
+def seed_catalogos(execution_id: UUID, reporter: ETLProgressReporter):
+    """
+    Puebla todos los catálogos de la aplicación (órganos + catálogos de referencia).
+
+    Llama al script existente load_all_catalogos.py que usa ORM con upsert.
+    """
+    log("=" * 60)
+    log("INICIANDO POBLAMIENTO DE CATÁLOGOS")
+    log("=" * 60)
+
+    try:
+        reporter.set_phase("loading", "Poblando catálogos de la aplicación")
+        reporter.update_progress(5)
+
+        # Añadir carpeta de catálogos al path para imports locales
+        catalogos_dir = SEEDING_DIR / "catalogos" / "load"
+        sys.path.insert(0, str(catalogos_dir))
+
+        from load_all_catalogos import main as run_catalogos
+
+        log("INFO: Ejecutando load_all_catalogos.main()...")
+        reporter.update_progress(10)
+
+        run_catalogos()
+
+        reporter.update_progress(90)
+
+        # Contar registros reales en las tablas de catálogo
+        from sqlalchemy import text
+        catalog_tables = [
+            "organo", "region", "instrumento", "tipo_beneficiario",
+            "sector_producto", "finalidad", "objetivo", "reglamento"
+        ]
+        total_records = 0
+        for tabla in catalog_tables:
+            try:
+                with get_session() as session:
+                    count = session.execute(text(f"SELECT COUNT(*) FROM bdns.{tabla}")).scalar()
+                    total_records += count or 0
+            except Exception:
+                pass
+
+        log(f"INFO: Total registros en catálogos: {total_records}")
+
+        reporter.update_progress(95)
+        reporter.complete(
+            records_processed=total_records,
+            records_inserted=total_records,
+            records_updated=0,
+            records_errors=0
+        )
+
+        log("SUCCESS: Catálogos poblados correctamente")
+        return 0
+
+    except Exception as e:
+        log(f"ERROR: Fallo en poblamiento de catálogos: {e}")
+        import traceback
+        traceback.print_exc()
+        reporter.fail(str(e))
+        return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description='ETL Real - Integración con extractores existentes')
+    parser.add_argument('--year', type=int, required=True, help='Año a procesar')
+    parser.add_argument('--mode', type=str, default='seeding', help='Modo: seeding o sync')
+    parser.add_argument('--entity', type=str, required=True, help='Entidad a procesar')
+    parser.add_argument('--batch-size', type=int, default=5000, help='Tamaño de batch')
+    parser.add_argument('--execution-id', type=str, required=True, help='ID de ejecución')
+    args = parser.parse_args()
+
+    execution_id = UUID(args.execution_id)
+    reporter = ETLProgressReporter(execution_id)
+
+    log("=" * 60)
+    log(f"PROCESO ETL REAL - {args.mode.upper()}")
+    log("=" * 60)
+    log(f"Entidad: {args.entity}")
+    log(f"Año: {args.year}")
+    log(f"Execution ID: {args.execution_id}")
+    log("")
+
+    try:
+        # Enrutar a la función apropiada según entidad
+        if args.entity == "catalogos":
+            exit_code = seed_catalogos(execution_id, reporter)
+
+        elif args.entity == "convocatorias":
+            exit_code = extract_convocatorias(args.year, execution_id, reporter)
+
+        elif args.entity == "concesiones":
+            # Concesiones ordinarias (endpoint estándar)
+            exit_code = extract_concesiones(args.year, execution_id, reporter, "ordinarias")
+
+        elif args.entity == "minimis":
+            exit_code = extract_concesiones(args.year, execution_id, reporter, "minimis")
+
+        elif args.entity == "ayudas_estado":
+            exit_code = extract_concesiones(args.year, execution_id, reporter, "ayudas_estado")
+
+        elif args.entity == "partidos_politicos":
+            exit_code = extract_concesiones(args.year, execution_id, reporter, "partidos_politicos")
+
+        elif args.entity == "grandes_beneficiarios":
+            exit_code = extract_concesiones(args.year, execution_id, reporter, "grandes_beneficiarios")
+
+        elif args.entity == "all":
+            log("INFO: Procesando TODAS las entidades para año {args.year}")
+            log("")
+
+            # 1. Convocatorias primero (dependencia)
+            log("PASO 1/6: Convocatorias")
+            result = extract_convocatorias(args.year, execution_id, reporter)
+            if result != 0:
+                return result
+
+            log("")
+            log("PASO 2/6: Concesiones ordinarias")
+            result = extract_concesiones(args.year, execution_id, reporter, "ordinarias")
+
+            log("")
+            log("PASO 3/6: Ayudas de minimis")
+            result = extract_concesiones(args.year, execution_id, reporter, "minimis")
+
+            log("")
+            log("PASO 4/6: Ayudas de estado")
+            result = extract_concesiones(args.year, execution_id, reporter, "ayudas_estado")
+
+            log("")
+            log("PASO 5/6: Partidos políticos")
+            result = extract_concesiones(args.year, execution_id, reporter, "partidos_politicos")
+
+            log("")
+            log("PASO 6/6: Grandes beneficiarios")
+            result = extract_concesiones(args.year, execution_id, reporter, "grandes_beneficiarios")
+
+            log("")
+            log("=" * 60)
+            log("SUCCESS: Todas las entidades procesadas correctamente")
+            log("=" * 60)
+
+            exit_code = 0
+
+        else:
+            log(f"ERROR: Entidad no reconocida: {args.entity}")
+            reporter.fail(f"Entidad no reconocida: {args.entity}")
+            exit_code = 1
+
+        return exit_code
+
+    except Exception as e:
+        log(f"ERROR: Error fatal en proceso ETL: {e}")
+        import traceback
+        traceback.print_exc()
+        reporter.fail(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("\nERROR: Proceso interrumpido por el usuario")
+        sys.exit(1)
+    except Exception as e:
+        log(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
