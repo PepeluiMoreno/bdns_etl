@@ -171,10 +171,13 @@ async def get_entities_status(
     catalogos_ok = sum(1 for c in catalogos_info["detalle"] if c["estado"] == "ok")
     total_registros_cat = sum(c["registros"] for c in catalogos_info["detalle"])
 
-    # catalogos_seeded = AND lógico de counts > 0 en TODAS las tablas de catálogo
-    catalogos_seeded = catalogos_info["inicializados"]
-
     convocatorias_seeded = etl_service.check_convocatorias_seeded(year)
+
+    # Consultar última ejecución exitosa de cada entidad (devuelve dict con stats)
+    ultima_cat = etl_service.get_last_successful_execution("catalogos")
+
+    # catalogos_seeded: tablas pobladas O ejecución exitosa de catálogos
+    catalogos_seeded = catalogos_info["inicializados"] or (ultima_cat is not None)
 
     catalogos_reason = None
     if not catalogos_seeded:
@@ -182,9 +185,6 @@ async def get_entities_status(
         catalogos_reason = f"Debe poblar primero los catálogos ({', '.join(faltantes)})"
 
     convocatorias_reason = None if convocatorias_seeded else "Debe poblar antes las convocatorias de ese año"
-
-    # Consultar última ejecución exitosa de cada entidad (devuelve dict con stats)
-    ultima_cat = etl_service.get_last_successful_execution("catalogos")
     ultima_conv = etl_service.get_last_successful_execution("convocatorias", year)
     ultima_conc = etl_service.get_last_successful_execution("concesiones", year)
     ultima_min = etl_service.get_last_successful_execution("minimis", year)
