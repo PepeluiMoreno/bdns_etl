@@ -84,6 +84,7 @@ def extract_concesiones_ordinarias(year: int) -> Path:
                     "_meta": {
                         "origen": "concesiones",
                         "regimen_tipo": "ordinaria",
+                        "prioridad": 1,
                         "fecha_extraccion": datetime.now().isoformat(),
                         "año": year,
                         "pagina": page

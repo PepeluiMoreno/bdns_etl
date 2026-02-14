@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 10000
 URL = "https://www.infosubvenciones.es/bdnstrans/api/partidospoliticos/busqueda"
-RUTA_RAW = Path(__file__).resolve().parent / "data" / "jsonl"
+RUTA_RAW = Path(__file__).resolve().parent.parent / "concesiones" / "data" / "jsonl"
 RUTA_RAW.mkdir(parents=True, exist_ok=True)
 
 
@@ -74,6 +74,7 @@ def extract_partidos_politicos(year: int) -> Path:
                     "_meta": {
                         "origen": "partidospoliticos",
                         "regimen_tipo": "partidos_politicos",
+                        "prioridad": 2,
                         "fecha_extraccion": datetime.now().isoformat(),
                         "año": year,
                         "pagina": page
