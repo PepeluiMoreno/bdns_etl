@@ -1,35 +1,37 @@
-[project]
-name = "etl-admin-backend"
-version = "1.0.0"
-description = "Backend de administración para procesos ETL de BDNS"
-requires-python = ">=3.12"
-dependencies = [
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.34.0",
-    "pydantic>=2.10.0",
-    "pydantic-settings>=2.7.0",
-    "sqlalchemy>=2.0.36",
-    "psycopg2-binary>=2.9.10",
-    "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
-    "python-multipart>=0.0.17",
-    "bdns-core",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.3.4",
-    "pytest-asyncio>=0.25.2",
-    "httpx>=0.28.1",
-]
-
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_backend"
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[project]
+name = "bdns-etl"
+version = "0.1.0"
+description = "ETL para BDNS"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Pepelui Moreno", email = "joseluis.morgomez@gmail.com"},
+]
+dependencies = [
+    "bdns-core>=0.1.0",
+    # API (mismo stack)
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-multipart>=0.0.6",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    # Base de datos (mismo stack)
+    "sqlalchemy>=2.0.23",
+    "asyncpg>=0.29.0",
+    # ETL específico
+    "requests>=2.31.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "python-dotenv>=1.0.0",
+]
 
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths = ["tests"]
+[tool.setuptools]
+packages = ["bdns_etl"]
+package-dir = {"" = "src"}
+
+[project.scripts]
+bdns-etl = "bdns_etl.main:main"

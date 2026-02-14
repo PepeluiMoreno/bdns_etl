@@ -1,144 +1,132 @@
+#!/usr/bin/env python3
 """
-Extractor de ayudas de estado desde la API BDNS.
-
-Las ayudas de estado tienen un periodo de retención de 10 años en la base de datos
-según normativa europea, y pueden no aparecer en los endpoints regulares de concesiones.
-
-Endpoint API: /api/ayudasestado/busqueda
+Extract: Ayudas de estado desde /ayudasestado/busqueda
+Genera JSONL con campos crudos + metadata de origen.
 """
 
 import json
-import requests
+import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+
+import requests
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+PAGE_SIZE = 10000
+URL = "https://www.infosubvenciones.es/bdnstrans/api/ayudasestado/busqueda"
+RUTA_RAW = Path(__file__).resolve().parent / "data" / "jsonl"
+RUTA_RAW.mkdir(parents=True, exist_ok=True)
 
 
-class AyudasEstadoExtractor:
-    """Extractor de ayudas de estado desde BDNS."""
-
-    def __init__(self, output_dir: Optional[Path] = None):
-        self.base_url = "https://www.infosubvenciones.es/bdnstrans/api"
-        self.output_dir = output_dir or Path(__file__).parent / "data"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def extract_ayudas_by_year(
-        self,
-        year: int,
-        page_size: int = 5000,
-        timeout: int = 180
-    ) -> List[Dict[str, Any]]:
-        """
-        Extrae ayudas de estado para un año específico.
-
-        Args:
-            year: Año a extraer
-            page_size: Registros por página (máximo 5000)
-            timeout: Timeout en segundos
-
-        Returns:
-            Lista de ayudas de estado
-        """
-        print(f"[AyudasEstado] Extrayendo año {year}...")
-
-        # Endpoint para búsqueda de ayudas de estado
-        endpoint = f"{self.base_url}/ayudasestado/busqueda"
-
-        all_records = []
-        page = 0
-
+def extract_ayudas_estado(year: int) -> Path:
+    """Extrae ayudas de estado y genera JSONL."""
+    desde = f"01/01/{year}"
+    hasta = f"31/12/{year}"
+    
+    output_path = RUTA_RAW / f"concesiones_ayudasestado_{year}.jsonl"
+    
+    logger.info(f"Iniciando extracción ayudas estado {year}")
+    
+    page = 0
+    total = 0
+    seen_ids = set()
+    
+    with open(output_path, "w", encoding="utf-8") as fout:
         while True:
             params = {
-                "fechaDesde": f"01/01/{year}",
-                "fechaHasta": f"31/12/{year}",
                 "page": page,
-                "pageSize": page_size
+                "pageSize": PAGE_SIZE,
+                "fechaDesde": desde,
+                "fechaHasta": hasta,
             }
-
+            
             try:
-                response = requests.get(
-                    endpoint,
-                    params=params,
-                    timeout=timeout,
-                    headers={"accept": "application/json"}
-                )
-                response.raise_for_status()
-                data = response.json()
-
-                content = data.get("content", [])
-                print(f"[AyudasEstado] Página {page}: {len(content)} registros")
-
-                if not content:
-                    break
-
-                all_records.extend(content)
-
-                # Verificar si hay más páginas
-                total_elements = data.get("totalElements", 0)
-                if len(all_records) >= total_elements:
-                    break
-
-                page += 1
-
-            except requests.exceptions.RequestException as e:
-                print(f"[AyudasEstado] Error en página {page}: {e}")
-                if page == 0:
-                    raise
+                r = requests.get(URL, params=params, timeout=180)
+                r.raise_for_status()
+                data = r.json()
+            except requests.RequestException as e:
+                logger.error(f"Error en página {page}: {e}")
+                raise
+            
+            content = data.get("content", [])
+            batch_count = 0
+            
+            for row in content:
+                id_concesion = str(row.get("idConcesion"))
+                
+                if id_concesion in seen_ids:
+                    logger.warning(f"Concesión {id_concesion} duplicada en extracción ayudas estado")
+                    continue
+                
+                seen_ids.add(id_concesion)
+                
+                record = {
+                    "_meta": {
+                        "origen": "ayudasestado",
+                        "regimen_tipo": "ayudas_estado",
+                        "fecha_extraccion": datetime.now().isoformat(),
+                        "año": year,
+                        "pagina": page
+                    },
+                    "id_concesion": id_concesion,
+                    "id_convocatoria_api": row.get("idConvocatoria"),
+                    "codigo_bdns": row.get("numeroConvocatoria"),
+                    "convocatoria_titulo": row.get("convocatoria"),
+                    "organo_nivel1": None,
+                    "organo_nivel2": None,
+                    "organo_nivel3": None,
+                    "organo_convocante": row.get("convocante"),
+                    "codigo_invente": None,
+                    "fecha_concesion": row.get("fechaConcesion"),
+                    "fecha_alta_registro": row.get("fechaAlta"),
+                    "id_beneficiario_api": row.get("idPersona"),
+                    "beneficiario_nombre": row.get("beneficiario"),
+                    "instrumento_descripcion": row.get("instrumento"),
+                    "reglamento_descripcion": row.get("reglamento"),
+                    "objetivo_descripcion": row.get("objetivo"),
+                    "tipo_beneficiario": row.get("tipoBeneficiario"),
+                    "sector_producto": None,
+                    "sector_actividad": row.get("sectores"),
+                    "region": row.get("region"),
+                    "ayuda_estado_codigo": row.get("ayudaEstado"),
+                    "ayuda_estado_url": row.get("urlAyudaEstado"),
+                    "entidad": row.get("entidad"),
+                    "intermediario": row.get("intermediario"),
+                    "importe_nominal": row.get("importe"),
+                    "importe_equivalente": row.get("ayudaEquivalente"),
+                    "url_bases_reguladoras": None,
+                    "tiene_proyecto": None,
+                }
+                
+                fout.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                fout.write("\n")
+                batch_count += 1
+            
+            total += batch_count
+            logger.info(f"Página {page}: {batch_count} registros (total únicos: {total})")
+            
+            if batch_count < PAGE_SIZE:
                 break
-
-        print(f"[AyudasEstado] Total extraído: {len(all_records)} registros")
-        return all_records
-
-    def save_to_json(self, data: List[Dict[str, Any]], year: int):
-        """Guarda los datos en formato JSON."""
-        filename = self.output_dir / f"ayudas_estado_{year}.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[AyudasEstado] Guardado en: {filename}")
-
-    def extract_all_years(self, year_from: int, year_to: int):
-        """
-        Extrae ayudas de estado para un rango de años.
-
-        Args:
-            year_from: Año inicial
-            year_to: Año final (inclusive)
-        """
-        for year in range(year_from, year_to + 1):
-            try:
-                data = self.extract_ayudas_by_year(year)
-                if data:
-                    self.save_to_json(data, year)
-            except Exception as e:
-                print(f"[AyudasEstado] Error extrayendo año {year}: {e}")
-
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Extrae ayudas de estado desde la API BDNS"
-    )
-    parser.add_argument(
-        "--year",
-        type=int,
-        required=True,
-        help="Año a extraer"
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        help="Directorio de salida"
-    )
-
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir) if args.output_dir else None
-    extractor = AyudasEstadoExtractor(output_dir=output_dir)
-
-    data = extractor.extract_ayudas_by_year(args.year)
-    extractor.save_to_json(data, args.year)
+            
+            page += 1
+    
+    logger.info(f"Extracción completada: {total} ayudas de estado")
+    return output_path
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Extrae ayudas de estado a JSONL")
+    parser.add_argument("--year", type=int, required=True, help="Año a extraer")
+    args = parser.parse_args()
+    
+    extract_ayudas_estado(args.year)

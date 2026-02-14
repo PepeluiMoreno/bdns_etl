@@ -1,172 +1,132 @@
+#!/usr/bin/env python3
 """
-Extractor de ayudas a partidos políticos desde la API BDNS.
-
-Este endpoint contiene concesiones y beneficiarios que no aparecen en el endpoint
-regular de concesiones, por lo que es necesario extraerlos por separado.
-
-Endpoint API: /api/partidospoliticos/busqueda
+Extract: Concesiones a partidos políticos desde /partidospoliticos/busqueda
+Genera JSONL con campos crudos + metadata de origen.
 """
 
 import json
-import requests
+import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+
+import requests
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+PAGE_SIZE = 10000
+URL = "https://www.infosubvenciones.es/bdnstrans/api/partidospoliticos/busqueda"
+RUTA_RAW = Path(__file__).resolve().parent / "data" / "jsonl"
+RUTA_RAW.mkdir(parents=True, exist_ok=True)
 
 
-class PartidosPoliticosExtractor:
-    """Extractor de ayudas a partidos políticos desde BDNS."""
-
-    def __init__(self, output_dir: Optional[Path] = None):
-        self.base_url = "https://www.infosubvenciones.es/bdnstrans/api"
-        self.output_dir = output_dir or Path(__file__).parent / "data"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def extract_partidos_by_year(
-        self,
-        year: int,
-        page_size: int = 10000,
-        timeout: int = 180
-    ) -> List[Dict[str, Any]]:
-        """
-        Extrae ayudas a partidos políticos para un año específico.
-
-        Args:
-            year: Año a extraer
-            page_size: Registros por página
-            timeout: Timeout en segundos
-
-        Returns:
-            Lista de ayudas a partidos políticos
-        """
-        print(f"[PartidosPoliticos] Extrayendo año {year}...")
-
-        endpoint = f"{self.base_url}/partidospoliticos/busqueda"
-
-        all_records = []
-        page = 0
-
+def extract_partidos_politicos(year: int) -> Path:
+    """Extrae concesiones a partidos políticos y genera JSONL."""
+    desde = f"01/01/{year}"
+    hasta = f"31/12/{year}"
+    
+    output_path = RUTA_RAW / f"concesiones_partidospoliticos_{year}.jsonl"
+    
+    logger.info(f"Iniciando extracción partidos políticos {year}")
+    
+    page = 0
+    total = 0
+    seen_ids = set()
+    
+    with open(output_path, "w", encoding="utf-8") as fout:
         while True:
             params = {
                 "page": page,
-                "pageSize": page_size,
-                "order": "numeroConvocatoria",
-                "direccion": "asc",
-                "vpd": "GE",
-                "descripcion": "Resolución",
-                "descripcionTipoBusqueda": "0",
-                "numeroConvocatoria": " ",
-                "codConcesion": " ",
-                "fechaDesde": f"01/01/{year}",
-                "fechaHasta": f"31/12/{year}",
-                "nifCif": " "
+                "pageSize": PAGE_SIZE,
+                "fechaDesde": desde,
+                "fechaHasta": hasta,
             }
-
+            
             try:
-                response = requests.get(
-                    endpoint,
-                    params=params,
-                    timeout=timeout,
-                    headers={"accept": "application/json"}
-                )
-                response.raise_for_status()
-                data = response.json()
-
-                content = data.get("content", [])
-                print(f"[PartidosPoliticos] Página {page}: {len(content)} registros")
-
-                if not content:
-                    break
-
-                all_records.extend(content)
-
-                # Verificar si hay más páginas
-                total_elements = data.get("totalElements", 0)
-                if len(all_records) >= total_elements:
-                    break
-
-                page += 1
-
-            except requests.exceptions.RequestException as e:
-                print(f"[PartidosPoliticos] Error en página {page}: {e}")
-                if page == 0:
-                    raise
+                r = requests.get(URL, params=params, timeout=180)
+                r.raise_for_status()
+                data = r.json()
+            except requests.RequestException as e:
+                logger.error(f"Error en página {page}: {e}")
+                raise
+            
+            content = data.get("content", [])
+            batch_count = 0
+            
+            for row in content:
+                id_concesion = str(row.get("id"))
+                
+                if id_concesion in seen_ids:
+                    logger.warning(f"Concesión {id_concesion} duplicada en extracción partidos políticos")
+                    continue
+                
+                seen_ids.add(id_concesion)
+                
+                record = {
+                    "_meta": {
+                        "origen": "partidospoliticos",
+                        "regimen_tipo": "partidos_politicos",
+                        "fecha_extraccion": datetime.now().isoformat(),
+                        "año": year,
+                        "pagina": page
+                    },
+                    "id_concesion": id_concesion,
+                    "id_convocatoria_api": row.get("idConvocatoria"),
+                    "codigo_bdns": row.get("numeroConvocatoria"),
+                    "convocatoria_titulo": row.get("convocatoria"),
+                    "organo_nivel1": row.get("nivel1"),
+                    "organo_nivel2": row.get("nivel2"),
+                    "organo_nivel3": row.get("nivel3"),
+                    "organo_convocante": None,
+                    "codigo_invente": row.get("codigoINVENTE"),
+                    "fecha_concesion": row.get("fechaConcesion"),
+                    "fecha_alta_registro": None,
+                    "id_beneficiario_api": None,  # No viene en este endpoint
+                    "beneficiario_nombre": row.get("beneficiario"),
+                    "instrumento_descripcion": row.get("instrumento"),
+                    "reglamento_descripcion": None,
+                    "objetivo_descripcion": None,
+                    "tipo_beneficiario": None,
+                    "sector_producto": None,
+                    "sector_actividad": None,
+                    "region": None,
+                    "ayuda_estado_codigo": None,
+                    "ayuda_estado_url": None,
+                    "entidad": None,
+                    "intermediario": None,
+                    "importe_nominal": row.get("importe"),
+                    "importe_equivalente": row.get("ayudaEquivalente"),
+                    "url_bases_reguladoras": row.get("urlBR"),
+                    "tiene_proyecto": row.get("tieneProyecto"),
+                }
+                
+                fout.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                fout.write("\n")
+                batch_count += 1
+            
+            total += batch_count
+            logger.info(f"Página {page}: {batch_count} registros (total únicos: {total})")
+            
+            if batch_count < PAGE_SIZE:
                 break
-
-        print(f"[PartidosPoliticos] Total extraído: {len(all_records)} registros")
-        return all_records
-
-    def extract_partido_detalle(self, codigo: str, timeout: int = 60) -> Optional[Dict[str, Any]]:
-        """
-        Extrae el detalle completo de una ayuda a partido político.
-
-        Args:
-            codigo: Código de la concesión
-            timeout: Timeout en segundos
-
-        Returns:
-            Detalle de la ayuda o None si hay error
-        """
-        endpoint = f"{self.base_url}/partidospoliticos/{codigo}"
-
-        try:
-            response = requests.get(endpoint, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"[PartidosPoliticos] Error obteniendo detalle {codigo}: {e}")
-            return None
-
-    def save_to_json(self, data: List[Dict[str, Any]], year: int):
-        """Guarda los datos en formato JSON."""
-        filename = self.output_dir / f"partidos_politicos_{year}.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[PartidosPoliticos] Guardado en: {filename}")
-
-    def extract_all_years(self, year_from: int, year_to: int):
-        """
-        Extrae partidos políticos para un rango de años.
-
-        Args:
-            year_from: Año inicial
-            year_to: Año final (inclusive)
-        """
-        for year in range(year_from, year_to + 1):
-            try:
-                data = self.extract_partidos_by_year(year)
-                if data:
-                    self.save_to_json(data, year)
-            except Exception as e:
-                print(f"[PartidosPoliticos] Error extrayendo año {year}: {e}")
-
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Extrae ayudas a partidos políticos desde la API BDNS"
-    )
-    parser.add_argument(
-        "--year",
-        type=int,
-        required=True,
-        help="Año a extraer"
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        help="Directorio de salida"
-    )
-
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir) if args.output_dir else None
-    extractor = PartidosPoliticosExtractor(output_dir=output_dir)
-
-    data = extractor.extract_partidos_by_year(args.year)
-    extractor.save_to_json(data, args.year)
+            
+            page += 1
+    
+    logger.info(f"Extracción completada: {total} concesiones a partidos políticos")
+    return output_path
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Extrae concesiones a partidos políticos a JSONL")
+    parser.add_argument("--year", type=int, required=True, help="Año a extraer")
+    args = parser.parse_args()
+    
+    extract_partidos_politicos(args.year)
