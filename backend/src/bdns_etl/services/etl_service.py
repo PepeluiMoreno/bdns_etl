@@ -836,6 +836,167 @@ class ETLService:
 
             return result
 
+    def get_coverage(self) -> List[Dict[str, Any]]:
+        """Obtiene cobertura de datos por entidad (registros cargados por año)."""
+        with get_session() as session:
+            entities = []
+
+            # Convocatorias
+            from bdns_core.db.models import Convocatoria, Concesion, Beneficiario
+            conv_count = session.execute(
+                select(func.count(Convocatoria.id))
+            ).scalar() or 0
+            conv_years = session.execute(
+                select(func.distinct(func.extract("year", Convocatoria.fecha_recepcion)))
+                .where(Convocatoria.fecha_recepcion.isnot(None))
+                .order_by(func.extract("year", Convocatoria.fecha_recepcion))
+            ).scalars().all()
+            entities.append({
+                "name": "convocatorias",
+                "label": "Convocatorias",
+                "records": conv_count,
+                "years": [int(y) for y in conv_years if y],
+                "coverage": min(100, int((len(conv_years) / 10) * 100)) if conv_years else 0
+            })
+
+            # Concesiones
+            conc_count = session.execute(
+                select(func.count(Concesion.id))
+            ).scalar() or 0
+            conc_years = session.execute(
+                select(func.distinct(func.extract("year", Concesion.fecha_concesion)))
+                .where(Concesion.fecha_concesion.isnot(None))
+                .order_by(func.extract("year", Concesion.fecha_concesion))
+            ).scalars().all()
+            entities.append({
+                "name": "concesiones",
+                "label": "Concesiones",
+                "records": conc_count,
+                "years": [int(y) for y in conc_years if y],
+                "coverage": min(100, int((len(conc_years) / 10) * 100)) if conc_years else 0
+            })
+
+            # Beneficiarios
+            ben_count = session.execute(
+                select(func.count(Beneficiario.id))
+            ).scalar() or 0
+            entities.append({
+                "name": "beneficiarios",
+                "label": "Beneficiarios",
+                "records": ben_count,
+                "years": [],
+                "coverage": 100 if ben_count > 0 else 0
+            })
+
+            # Catálogos (instrumentos, regimenes, organos, etc.)
+            from bdns_core.db.models import Instrumento, RegimenAyuda, Organo
+            cat_count = 0
+            for model in [Instrumento, RegimenAyuda, Organo]:
+                cat_count += session.execute(
+                    select(func.count(model.id))
+                ).scalar() or 0
+            entities.append({
+                "name": "catalogos",
+                "label": "Catálogos",
+                "records": cat_count,
+                "years": ["N/A"],
+                "coverage": 100 if cat_count > 0 else 0
+            })
+
+            return entities
+
+    def get_alerts(self) -> List[Dict[str, Any]]:
+        """Genera alertas basadas en el estado de las ejecuciones."""
+        alerts = []
+        with get_session() as session:
+            # Ejecuciones fallidas recientes (últimas 24h)
+            from datetime import timedelta
+            since = datetime.utcnow() - timedelta(hours=24)
+            failed = session.execute(
+                select(EtlExecution)
+                .where(
+                    EtlExecution.status == "failed",
+                    EtlExecution.started_at >= since
+                )
+                .order_by(desc(EtlExecution.started_at))
+            ).scalars().all()
+
+            for ex in failed:
+                alerts.append({
+                    "type": "error",
+                    "title": f"Fallo en {ex.execution_type}: {ex.entity or 'all'}",
+                    "message": ex.error_message or "Error desconocido",
+                    "execution_id": str(ex.id),
+                    "timestamp": ex.started_at.isoformat() if ex.started_at else None
+                })
+
+            # Ejecuciones en running > 1 hora (posible colgada)
+            hour_ago = datetime.utcnow() - timedelta(hours=1)
+            stuck = session.execute(
+                select(EtlExecution)
+                .where(
+                    EtlExecution.status == "running",
+                    EtlExecution.started_at <= hour_ago
+                )
+            ).scalars().all()
+
+            for ex in stuck:
+                elapsed = int((datetime.utcnow() - ex.started_at).total_seconds() / 60)
+                alerts.append({
+                    "type": "warning",
+                    "title": f"Proceso posiblemente bloqueado",
+                    "message": f"{ex.execution_type} {ex.entity or 'all'} lleva {elapsed} min ejecutándose",
+                    "execution_id": str(ex.id),
+                    "timestamp": ex.started_at.isoformat() if ex.started_at else None
+                })
+
+        return alerts
+
+    async def retry_failed_executions(self) -> Dict[str, Any]:
+        """Reintenta las ejecuciones fallidas más recientes de cada entidad."""
+        retried = []
+        with get_session() as session:
+            # Obtener la última ejecución fallida por entidad
+            from sqlalchemy import and_
+            subq = (
+                select(
+                    EtlExecution.entity,
+                    func.max(EtlExecution.started_at).label("max_started")
+                )
+                .where(EtlExecution.status == "failed")
+                .group_by(EtlExecution.entity)
+                .subquery()
+            )
+            failed = session.execute(
+                select(EtlExecution)
+                .join(subq, and_(
+                    EtlExecution.entity == subq.c.entity,
+                    EtlExecution.started_at == subq.c.max_started
+                ))
+                .where(EtlExecution.status == "failed")
+            ).scalars().all()
+
+            for ex in failed:
+                try:
+                    result = await self.start_seeding(
+                        year=ex.year or datetime.utcnow().year,
+                        entity=ex.entity or "all"
+                    )
+                    retried.append({
+                        "original_id": str(ex.id),
+                        "new_execution_id": result.get("execution_id"),
+                        "entity": ex.entity,
+                        "year": ex.year
+                    })
+                except Exception as e:
+                    retried.append({
+                        "original_id": str(ex.id),
+                        "entity": ex.entity,
+                        "error": str(e)
+                    })
+
+        return {"retried": retried, "count": len(retried)}
+
 
 # Singleton
 etl_service = ETLService()

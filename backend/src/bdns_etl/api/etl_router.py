@@ -400,5 +400,182 @@ async def start_seeding(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/coverage")
+async def get_coverage(
+    current_user: UserInToken = Depends(get_current_user)
+):
+    """
+    Obtiene cobertura de datos por entidad (registros cargados por año).
+    """
+    try:
+        entities = etl_service.get_coverage()
+        return {"entities": entities}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/alerts")
+async def get_alerts(
+    current_user: UserInToken = Depends(get_current_user)
+):
+    """
+    Obtiene alertas activas del sistema ETL.
+    """
+    try:
+        alerts = etl_service.get_alerts()
+        return alerts
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/retry-failed")
+async def retry_failed(
+    current_user: UserInToken = Depends(require_admin)
+):
+    """
+    Reintenta todas las ejecuciones fallidas más recientes.
+
+    **Requiere rol de admin.**
+    """
+    try:
+        result = await etl_service.retry_failed_executions()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/sync/start", response_model=ExecutionResponse)
-async
+async def start_sync(
+    request: StartSyncRequest,
+    current_user: UserInToken = Depends(require_admin)
+):
+    """
+    Inicia proceso de sincronización (actualización incremental).
+
+    **Requiere rol de admin.**
+    """
+    try:
+        result = await etl_service.start_sync(
+            year=request.year,
+            entity=request.entity,
+            incremental=request.incremental,
+            days_back=request.days_back
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/execution/{execution_id}/stop")
+async def stop_execution(
+    execution_id: UUID,
+    current_user: UserInToken = Depends(require_admin)
+):
+    """
+    Detiene una ejecución en curso.
+
+    **Requiere rol de admin.**
+    """
+    result = await etl_service.stop_execution(execution_id)
+    if not result["success"]:
+        raise HTTPException(status_code=404, detail=result.get("error", "Unknown error"))
+    return result
+
+
+@router.delete("/execution/{execution_id}")
+async def delete_execution(
+    execution_id: UUID,
+    current_user: UserInToken = Depends(require_admin)
+):
+    """
+    Elimina un registro de ejecución del historial.
+
+    **Requiere rol de admin.**
+    """
+    result = etl_service.delete_execution(execution_id)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "Unknown error"))
+    return result
+
+
+@router.post("/entities/{entity}/clean-temp")
+async def clean_temp_files(
+    entity: str,
+    year: Optional[int] = Query(None),
+    current_user: UserInToken = Depends(require_admin)
+):
+    """
+    Elimina archivos temporales de una entidad/año.
+
+    **Requiere rol de admin.**
+    """
+    result = etl_service.clean_temp_files(entity, year)
+    return result
+
+
+# ==========================================
+# WEBSOCKET para actualizaciones en tiempo real
+# ==========================================
+
+class ConnectionManager:
+    """Gestiona conexiones WebSocket para streaming de progreso."""
+
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        """Envía mensaje a todos los clientes conectados."""
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except:
+                pass
+
+
+manager = ConnectionManager()
+
+
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket para recibir actualizaciones de progreso en tiempo real.
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            stats = etl_service.get_statistics_summary()
+            recent = etl_service.list_recent_executions(limit=10)
+            active = etl_service.list_active_executions()
+
+            await websocket.send_json({
+                "type": "stats_update",
+                "data": {
+                    "statistics": stats,
+                    "recent_executions": recent,
+                    "active_processes": active
+                },
+                "timestamp": asyncio.get_event_loop().time()
+            })
+
+            for process in active:
+                await websocket.send_json({
+                    "type": "process_update",
+                    "data": process,
+                    "timestamp": asyncio.get_event_loop().time()
+                })
+
+            await asyncio.sleep(2)
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        manager.disconnect(websocket)
