@@ -17,8 +17,9 @@ RUN pip install --no-cache-dir -e /bdns_core
 
 COPY backend/pyproject.toml ./
 COPY --chown=bdns:bdns backend/src ./src
+COPY --chown=bdns:bdns backend/main.py ./main.py
 RUN pip install --no-cache-dir -e .
 
 USER bdns
 
-CMD ["python", "-m", "bdns_etl.main"]
+CMD ["python", "main.py"]
